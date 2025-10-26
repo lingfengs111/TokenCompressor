@@ -1,0 +1,17 @@
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
+
+# 忽略 artifacts
+artifacts/
+
+# 忽略大数据目录（除了 movielens1m）
+data/*
+!data/movielens1m/
+
+# 忽略临时文件
+*.log
+*.tmp
+*.pth
+*.ckpt
+*.pt

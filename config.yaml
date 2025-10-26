@@ -1,0 +1,63 @@
+data:
+  name: movielens1m
+  min_items_per_user: 5
+  max_seq_len: 1000
+  L_real: 128
+  rebuild: true
+items:
+  num_items: null        # 置 null 会按预处理自动填
+  d_model: 512
+  trainable: false       # 冻结 item 空间，保证压缩泛化结论干净
+  
+  init_from_text: true        # 是否用文本初始化 item embedding
+  init_path: "emb/e_text_init.pt"   # 生成后的权重文件
+student:
+  t5_name: t5-small
+  grad_ckpt: false
+head:
+  pool: last
+compressor:
+  L_soft: 160
+mixflow:
+  inner_steps: 6
+  inner_lr: 3.0e-2
+  momentum: 0.9
+  lora_rank: 8
+  lora_alpha: 16.0
+  target_blocks: 2
+  dropout: 0.0
+  full_ft: false         # 改 true 即全量微调 encoder
+outer:
+  lr: 5.0e-3
+train:
+  batch_size: 128
+  epochs: 20
+  seed: 1234
+  log_every: 20
+  loss_positions: last  # 现阶段支持 'last'；上 'all' 需要 decoder-lm 或因果 mask
+
+  eval_every_steps: 200      # 或者用 eval_every_epochs
+  max_eval_batches: 50        # 评测只跑前 50 个 batch（加速；设 None 跑全量）
+  save_best: true
+  metrics_topk: [10, 20, 50]
+  
+system:
+  device: cuda
+  amp: bf16
+eval:
+  k_list: [10, 20, 50]
+  clip_last: true       # 是否裁剪到最近 L_real_eval
+  modes:
+    - {name: full,   L_soft: 0,   L_real: 1000}
+    - {name: recent, L_soft: 0,   L_real: 128}
+    - {name: patch,  L_soft: 160, L_real: 128}
+  
+  eval_every: 1000  # 每多少 it 评测一次
+  save_best: true
+  out_dir: outputs/movielens20m/soft_patch
+  keep_ckpt: false
+  best_metric: NDCG@20
+  best_mode: patch
+  max_ckpt: 3
+  num_workers: 4
+  rebuild: false      # 置 true 会强制重建评测数据集  
