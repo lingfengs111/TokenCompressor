@@ -3,6 +3,7 @@ data:
   min_items_per_user: 5
   max_seq_len: 1000
   L_real: 128
+  L_real_train: 256      # 新增：训练/在线CRE用更长的loader
   rebuild: true
 items:
   num_items: null        # 置 null 会按预处理自动填
@@ -17,7 +18,7 @@ student:
 head:
   pool: last
 compressor:
-  L_soft: 160
+  L_soft: 64
 mixflow:
   inner_steps: 6
   inner_lr: 3.0e-2
@@ -42,7 +43,7 @@ train:
   metrics_topk: [10, 20, 50]
   
 system:
-  device: cuda
+  device: cuda:1
   amp: bf16
 eval:
   k_list: [10, 20, 50]
@@ -50,8 +51,10 @@ eval:
   modes:
     - {name: full,   L_soft: 0,   L_real: 1000}
     - {name: recent, L_soft: 0,   L_real: 128}
-    - {name: patch,  L_soft: 160, L_real: 128}
+    - {name: patch,  L_soft: 64, L_real: 128}
   
+  batch_size_full: 16    # 仅 full loader 用的小批量
+
   eval_every: 1000  # 每多少 it 评测一次
   save_best: true
   out_dir: outputs/movielens20m/soft_patch
@@ -61,3 +64,25 @@ eval:
   max_ckpt: 3
   num_workers: 4
   rebuild: false      # 置 true 会强制重建评测数据集  
+
+cre:
+  # ckpt_path: “artifacts/ckpt3.pt   # 取代代码里硬编码的 ckpt 路径
+  epochs: 20
+  lr: 1.0e-4
+  wd: 0.0
+  early_stop: 3
+  metric: NDCG@20                 # 与 eval.best_metric 对齐
+  grad_clip: 0.0                  # 需要的话开
+  seed: 1234
+  max_train_batches: null         # 调试可设小整数；null=全量
+  max_val_batches: null
+
+cre_online:
+  epochs: 5               # 在线评测每次重训的 epoch 数（离线可以 20，在线建议小些）
+  lr: 1.0e-4
+  wd: 0.0
+  early_stop: 2
+  metric: NDCG@20
+  grad_clip: 0.0
+  max_train_batches: 500   # 可选：在线评测只取一部分 batch，控制时间
+  max_val_batches: 200     # 可选：验证也限量

@@ -2,11 +2,11 @@ import os, json, yaml, torch
 from transformers import logging as hf_logging
 hf_logging.set_verbosity_error()
 
-from utils import set_seed, AmpAutocast, max_cuda_gb
-from model_id_t5 import ItemTable, GlobalSoftPatch, build_student, apply_lora_qv, logits_from_ids
+from utils import set_seed, AmpAutocast, cuda_mem_gb
+from model_id_t5 import ItemTable, GlobalSoftPatch, build_student, apply_lora_qv
 from loss import ce_full_softmax
 from mixflow import get_fwdrev_grad_fn_eta, MomentumInner
-
+from eval import run_eval_online_cre
 
 def train(cfg:dict):
     path = os.path.dirname(__file__)
@@ -23,7 +23,11 @@ def train(cfg:dict):
 
     # 用 train.txt 的 dataloader
     from data import make_dataloaders_from_txt
-    dl_tr, dl_va, dl_te = make_dataloaders_from_txt(proc_dir, cfg["data"]["L_real"], cfg["train"]["batch_size"])
+
+    # dl_tr, dl_va, dl_te = make_dataloaders_from_txt(proc_dir, cfg["data"]["L_real"], cfg["train"]["batch_size"])
+    # 训练/在线CRE：用更长的训练loader
+    L_real_train = cfg["data"].get("L_real_train", cfg["data"]["L_real"])
+    dl_tr, dl_va, _ = make_dataloaders_from_txt(proc_dir, L_real_train, cfg["train"]["batch_size"])
 
     # modules
     E = ItemTable(cfg["items"]["num_items"], cfg["items"]["d_model"], trainable=cfg["items"]["trainable"]).to(device)
@@ -159,12 +163,14 @@ def train(cfg:dict):
             opt_eta.step()
             inner_opt.restore(w_state, m_state)
             if it % cfg["train"]["log_every"]==0:
-                print(f"[it {it:06d}] loss_outer={loss_outer.item():.4f} | max CUDA(GB)={max_cuda_gb():.3f}")
+                peak = cuda_mem_gb(model=student, device_str=cfg["system"]["device"], kind="alloc")
+                print(f"[it {it:06d}] loss_outer={loss_outer.item():.4f} | max CUDA(GB)={peak:.3f}")
+
 
             # === 周期性评测 ===
-            from utils import pack_theta_state, run_eval_online
+            from utils import pack_theta_state
             if cfg["train"]["eval_every_steps"] and (it % cfg["train"]["eval_every_steps"] == 0):
-                metrics = run_eval_online(student, E, phi, dl_va, cfg)
+                metrics = run_eval_online_cre(E, phi, dl_tr, dl_va, cfg)
                 ndcg20 = metrics.get("NDCG@20", 0.0)
                 print(f"[eval it {it}] " + " ".join([f"{k}={v:.4f}" for k,v in metrics.items()]))
 
@@ -183,8 +189,8 @@ def train(cfg:dict):
                     print(f"[save] best checkpoint at it={it} (NDCG@20={ndcg20:.4f})")
     # save
     os.makedirs("artifacts", exist_ok=True)
-    torch.save({"phi":phi.state_dict(),"item_table":E.state_dict(),"cfg":cfg}, os.path.join(path, "artifacts","ckpt3.pt"))
-    print("Saved artifacts/ckpt3.pt")
+    torch.save({"phi":phi.state_dict(),"item_table":E.state_dict(),"cfg":cfg}, os.path.join(path, "artifacts","ckpt4.pt"))
+    print("Saved artifacts/ckpt4.pt")
 
 
 if __name__=='__main__':

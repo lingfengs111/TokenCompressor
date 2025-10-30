@@ -15,9 +15,21 @@ class AmpAutocast:
     def __exit__(self, et, ex, tb):
         if self.ctx: self.ctx.__exit__(et, ex, tb)
 
-def max_cuda_gb():
-    return (torch.cuda.max_memory_allocated()/(1024**3)) if torch.cuda.is_available() else 0.0
-
+def cuda_mem_gb(model=None, device_str=None, kind="alloc", reset=False):
+    if not torch.cuda.is_available(): return 0.0
+    device = torch.device(device_str) if device_str else (
+        next(model.parameters()).device if model is not None
+        else torch.device(f"cuda:{torch.cuda.current_device()}")
+    )
+    if reset: torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    if kind == "alloc":
+        bytes_ = torch.cuda.max_memory_allocated(device)
+    elif kind == "reserved":
+        bytes_ = torch.cuda.max_memory_reserved(device)
+    else:
+        bytes_ = torch.cuda.memory_allocated(device)
+    return bytes_ / (1024**3)
 
 def pack_theta_state(student, theta_param_names):
     state = {}
@@ -25,45 +37,3 @@ def pack_theta_state(student, theta_param_names):
     for n in theta_param_names:
         state[n] = sd[n].clone()
     return state
-
-
-@torch.no_grad()
-def run_eval_online(student, E, phi, dl_val, cfg):
-    student.eval()
-    ks = tuple(cfg["train"]["metrics_topk"])
-    max_batches = cfg["train"]["max_eval_batches"]
-
-    tot = 0
-    hit = {k: 0.0 for k in ks}
-    ndcg = {k: 0.0 for k in ks}
-
-    L_soft = cfg["compressor"]["L_soft"]
-
-    done = 0
-    for recent_ids, targets, mask_recent in dl_val:
-        B = targets.size(0)
-        # 全 soft
-        inputs = phi.phi.unsqueeze(0).expand(B, -1, -1).to(student.device)
-        attn   = torch.ones((B, L_soft), dtype=torch.long, device=student.device)
-
-        out = student.encoder(inputs_embeds=inputs, attention_mask=attn, return_dict=True)
-        u = out.last_hidden_state[:, -1, :]                               # [B, d]
-        scores = (u @ E.table[1:].T).float()                              # [B, |I|]
-        tgt = (targets - 1).to(scores.device)                             # [B]
-
-        maxk = max(ks)
-        _, topk_idx = torch.topk(scores, k=maxk, dim=1)                   # [B, maxk]
-        hits = (topk_idx == tgt.unsqueeze(1))                             # [B, maxk]
-        ranks = torch.argmax(hits.float(), dim=1)                          # 0..maxk-1（未命中时值0，但乘命中掩码）
-        for k in ks:
-            h = hits[:, :k].any(dim=1).float()
-            hit[k]  += h.sum().item()
-            ndcg[k] += (h * (1.0 / torch.log2(ranks.float() + 2.0))).sum().item()
-
-        tot += B
-        done += 1
-        if max_batches is not None and done >= max_batches:
-            break
-
-    student.train()
-    return {f"HR@{k}": hit[k]/tot for k in ks} | {f"NDCG@{k}": ndcg[k]/tot for k in ks}
