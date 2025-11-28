@@ -123,11 +123,17 @@ def collect_scores_targets(
             ids_eval  = recent_ids[:, -L_real_eval:]
             mask_eval = mask_recent[:, -L_real_eval:]
 
+        # 1) 取得 eta —— 支持张量或模块
+        if hasattr(eta_tensor, "forward"):    # Compressor 模块
+            eta_b = eta_tensor(item_table, recent_ids, mask_recent)    # [B, L_soft, d]
+        else:
+            eta_b = eta_tensor                                           # [L_soft, d] 或空
+        # 2) 计算 scores
         with _amp_ctx(amp_setting):
             scores, _ = logits_from_ids(
                 student=student,
                 item_table=item_table,
-                eta_tensor=eta_tensor.to(device),
+                eta_tensor=eta_b,          #更改： [L_soft, d] 或 [B, L_soft, d] 或空
                 recent_ids=ids_eval,
                 mask_recent=mask_eval,
                 L_soft=L_soft_eval,
@@ -175,11 +181,12 @@ def cre_train_one_mode(
 
             ids_eval, mask_eval = clip_right_pad(recent_ids, mask_recent, L_real)
 
+            eta_b = eta_tensor(item_table, recent_ids, mask_recent) if hasattr(eta_tensor, "forward") else eta_tensor
             with _amp_ctx(amp_setting):
                 logits, _ = logits_from_ids(
                     student=student,
                     item_table=item_table,
-                    eta_tensor=eta_tensor,          # [L_soft, d] 或空
+                    eta_tensor=eta_b,         #更改： [L_soft, d] 或 [B, L_soft, d] 或空
                     recent_ids=ids_eval,
                     mask_recent=mask_eval,
                     L_soft=L_soft,
@@ -266,13 +273,11 @@ def evaluate(cfg: dict):
     #     torch.quantile(torch.cat(lens).float(), torch.tensor(0.5)).item(),
     #     torch.cat(lens).max().item())
 
-
+    ckpt_num = cfg["system"].get("ckpt_num", 4)
+    print(f"[Eval] Loading ckpt #{ckpt_num} ...")
     # 载入 ckpt（ItemTable + φ）
-    ckpt_path = (
-        cfg.get("cre", {}).get("ckpt_path")
-        or cfg.get("eval", {}).get("ckpt_path")
-        or os.path.join(file_path, "artifacts", "ckpt3.pt")
-    )
+    dsname = cfg["data"]["name"]
+    ckpt_path = os.path.join(file_path, "artifacts", dsname, f"checkpoint_{ckpt_num}.pt")
     ckpt = torch.load(ckpt_path, map_location=device)
 
     with open(os.path.join(proc_dir, "item2idx.json")) as f:
@@ -283,6 +288,15 @@ def evaluate(cfg: dict):
     E.load_state_dict(ckpt["item_table"])
     print(f"[Init] ItemTable: num_items={num_items}, d_model={cfg['items']['d_model']}, trainable=False")
 
+    E.use_cosine_default = True
+    if "logit_scale" in ckpt:
+        E.logit_scale = ckpt["logit_scale"].to(device)   # 直接挂回去（对数温度）
+    else:
+        E.logit_scale = torch.tensor(0.0, device=device) # 默认 temperature=1.0
+    E.normalize_patch_default = True
+    E.patch_norm_kind = cfg["compressor"].get("patch_norm", "l2")
+
+    
     phi_state = ckpt["phi"]
 
     # 评测配置
@@ -313,9 +327,11 @@ def evaluate(cfg: dict):
 
     results = {}
     for mode in modes:
-
+        print("doing eval mode:", mode)
         name        = str(mode["name"]).lower()
         L_soft_eval = int(mode["L_soft"])
+        d_model = E.table.size(1)
+
         L_real_eval = int(mode["L_real"])
 
         # 给 full 模式用专门的 loader
@@ -324,21 +340,22 @@ def evaluate(cfg: dict):
         else:
             dl_tr_mode, dl_va_mode, dl_te_mode = base_dl_tr, base_dl_va, base_dl_te
         
-        # 构造 eta（空补丁或从 ckpt 还原）
-        if L_soft_eval > 0:
-            if phi_len_ckpt != L_soft_eval:
-                raise RuntimeError(
-                    f"[eval] Soft-patch length mismatch: ckpt phi_len={phi_len_ckpt}, "
-                    f"but eval.modes[{name}].L_soft={L_soft_eval}. "
-                    f"→ 请确保 ckpt 与配置一致或调整配置/重导出 ckpt。\nckpt_path={ckpt_path}"
-                )
-            d_model = E.table.size(1)
-            phi = GlobalSoftPatch(L_soft_eval, d_model, device=device).to(device)
-            phi.load_state_dict(phi_state)
-            eta_eval = phi.phi  # [L_soft, d]
+        from compressors import build_compressor
+        # 选择 compressor 类型
+        comp_kind   = cfg["compressor"].get("type", "soft")
+        if L_soft_eval > 0 and comp_kind != "soft":
+            # 生成型 compressor（η 为 [B,L_soft,d]）：直接构建模块
+            eta_eval = build_compressor(comp_kind, d_model, L_soft_eval,
+                                        n_heads=cfg["compressor"].get("n_heads", 8),
+                                        dropout=cfg["compressor"].get("dropout", 0.1)).to(device)
         else:
-            d_model = E.table.size(1)
-            eta_eval = torch.empty(0, d_model, device=device)
+            # 旧的 GlobalSoftPatch（η 为 [L_soft,d]）：从 ckpt 恢复
+            if L_soft_eval > 0:
+                phi = GlobalSoftPatch(L_soft_eval, d_model, device=device).to(device)
+                phi.load_state_dict(phi_state)
+                eta_eval = phi.phi
+            else:
+                eta_eval = torch.empty(0, d_model, device=device)
 
         # 从同一起点初始化新的 student
         student = build_student(cfg["student"]["t5_name"], device, cfg["student"]["grad_ckpt"])
@@ -365,6 +382,17 @@ def evaluate(cfg: dict):
         results[name] = metrics
         print(f"[CRE|{name}] val_best={best_val:.4f}  " +
               " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+
+        # if cfg["eval"].get("sampled_eval", {}).get("enabled", False):
+        #     from eval_sample import eval_sampled_one_mode, _load_seen
+        #     seen = _load_seen(proc_dir)
+        #     num_items = E.table.size(0) - 1
+        #     m_samp = eval_sampled_one_mode(student, E, eta_eval,
+        #                                 dl_te_mode, L_soft_eval, L_real_eval, pool,
+        #                                 cfg["system"]["amp"], num_items,
+        #                                 cfg["eval"]["sampled_eval"]["num_neg"],
+        #                                 seen, device)
+        #     print(f"[CRE-sampled|{name}] " + " ".join(f"{k}={v:.4f}" for k,v in m_samp.items()))
 
     return results
 
@@ -393,14 +421,15 @@ def run_eval_online_cre(E, phi, dl_tr, dl_va, cfg):
     L_soft = int(mcfg["L_soft"])
     L_real = int(mcfg["L_real"])
 
-    # 构造 eta（在线：直接用当前 φ.phi）
-    if L_soft > 0:
-        eta = phi.phi.to(device)
-        if eta.size(0) != L_soft:
-            raise AssertionError(f"[online_cre] phi length {eta.size(0)} != L_soft {L_soft}")
+    # 选择 compressor 类型
+    comp_kind = cfg["compressor"].get("type", "soft")
+    if L_soft > 0 and comp_kind != "soft":
+        from compressors import build_compressor
+        eta = build_compressor(comp_kind, E.table.size(1), L_soft,
+                            n_heads=cfg["compressor"].get("n_heads", 8),
+                            dropout=cfg["compressor"].get("dropout", 0.1)).to(device)
     else:
-        d_model = E.table.size(1)
-        eta = torch.empty(0, d_model, device=device)
+        eta = phi.phi.to(device) if L_soft > 0 else torch.empty(0, E.table.size(1), device=device)
 
     # CRE 在线评测用的超参（如未配置，则回退到 cre.*）
     cre_on = cfg.get("cre_online", {})

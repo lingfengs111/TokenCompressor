@@ -18,8 +18,15 @@ class TxtSeqDataset(Dataset):
         self.stage = stage
         self.L_real = L_real
         self.rows = []
+        
+        # 显示进度提示
+        print(f"[Loading] {stage} dataset from {txt_path}...", flush=True)
+        
         with open(txt_path, "r") as f:
-            for line in f:
+            for line_idx, line in enumerate(f):
+                if (line_idx + 1) % 10000 == 0:
+                    print(f"  Loaded {line_idx + 1} lines...", flush=True)
+                    
                 parts = [int(x) for x in line.strip().split()]
                 if len(parts) < 3:  # user + >=2 items → len >= 3
                     continue
@@ -27,6 +34,8 @@ class TxtSeqDataset(Dataset):
                 if len(items) < 2:  # 至少两个 item 才能构建 val/test
                     continue
                 self.rows.append(items)
+        
+        print(f"[Loaded] {stage} dataset: {len(self.rows)} sequences", flush=True)
 
     def __len__(self): return len(self.rows)
 
