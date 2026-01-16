@@ -3,6 +3,16 @@ import os, argparse, json, numpy as np
 import torch
 from tqdm import tqdm
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    v = v.lower()
+    if v in ("true", "1", "yes", "y"):
+        return True
+    if v in ("false", "0", "no", "n"):
+        return False
+    raise ValueError(f"Invalid boolean: {v}")
+
 def load_items_list(items_txt_path, to_lower=True):
     """
     读取 items.txt: 每行  item_id \t text
@@ -114,35 +124,50 @@ def build_E_tensor(Z_proj, item2idx_path, d_model, save_path, items_txt_path=Non
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    # ap.add_argument("--items_txt_path", required=True)          # item_id \t text
-    # ap.add_argument("--item2idx_path", required=True)           # JSON: raw -> idx (1..|I|)
     ap.add_argument("--model", default="sentence-transformers/sentence-t5-base")  # 768d，也可用 "all-MiniLM-L6-v2" 384d 等
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--max_length", type=int, default=128)
     ap.add_argument("--normalize", default="true")
     ap.add_argument("--to_lower", default="false")
-    ap.add_argument("--d_model", type=int, default=512)
-    ap.add_argument("--pca_to_d_model", default="true")
+    ap.add_argument("--d_model", type=int, default=768)
+    # 是否用 PCA 把文本嵌入降到 d_model 维
+    ap.add_argument("--pca_to_d_model", default="false")
     ap.add_argument("--pca_batch_size", type=int, default=4096)
-    # ap.add_argument("--save_path", default="artifacts/e_text_init.pt")
-    # ap.add_argument("--save_pca", default="artifacts/pca_proj.npz")
     args = ap.parse_args()
     
+
+    # 把字符串参数转成真正的 bool
+    to_lower = str2bool(args.to_lower)
+    normalize = str2bool(args.normalize)
+    pca_to_d_model = str2bool(args.pca_to_d_model)
+
+
     path = os.path.dirname(__file__)
     items_txt_path = os.path.join(path, 'proc', 'text.txt')
     item2idx_path = os.path.join(path, 'proc', 'item2idx.json')
 
-    save_path = os.path.join(path, 'emb', 'e_text_init.pt')
+    # 跑之前改一下路径的名字
+    save_path = os.path.join(path, 'emb', 'ml-1m_text_emb_768d.pt')
     save_pca = os.path.join(path, 'emb', 'pca_proj.npz')
+
     items = load_items_list(items_txt_path, to_lower=args.to_lower)
     Z = encode_texts(items, args.model, args.batch_size, args.max_length, normalize=args.normalize)  # [N, d_txt]
 
-    if args.pca_to_d_model and Z.shape[1] != args.d_model:
-        Zp, _ = fit_or_load_pca(Z, args.d_model, save_pca=save_pca, load_if_exists=True, batch_size=args.pca_batch_size)
+    if pca_to_d_model and Z.shape[1] != args.d_model:
+        Zp, _ = fit_or_load_pca(
+            Z,
+            args.d_model,
+            save_pca=save_pca,
+            load_if_exists=True,
+            batch_size=args.pca_batch_size,
+        )
     else:
         Zp = Z.astype(np.float32)
         if Zp.shape[1] != args.d_model:
-            raise ValueError(f"Text dim={Zp.shape[1]} != d_model={args.d_model}; enable --pca_to_d_model or choose a 512d text model.")
+            raise ValueError(
+                f"Text dim={Zp.shape[1]} != d_model={args.d_model}; "
+                f"enable --pca_to_d_model or choose a {args.d_model}d text model."
+            )
 
     E = build_E_tensor(Zp, item2idx_path, args.d_model, save_path, items_txt_path=items_txt_path)
     print("Saved:", save_path, "| shape:", tuple(E.shape))

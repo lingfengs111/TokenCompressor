@@ -1,4 +1,3 @@
-
 """
 mixflow.py
 ----------
@@ -44,7 +43,7 @@ def _unflatten(flat: torch.Tensor, shapes: List[torch.Size]) -> List[torch.Tenso
 
 def get_fwdrev_grad_fn_eta(inner_loss_fn):
     """
-    Build a function G(theta_list, eta, *rest) -> flat_grad_theta
+    Build a function G(theta_list, eta, *rest_tensors) -> flat_grad_theta
     whose backward implements:
       - grad wrt theta_flat input: H_{θθ} · v  (efficient HVP via JVP)
       - grad wrt eta:             H_{θη} · v  (efficient MVP via VJP)
@@ -117,14 +116,21 @@ class MomentumInner:
         self.m = [torch.zeros_like(p) for p in params]
 
     def step(self, grad_flat: torch.Tensor):
+        """Differentiable SGD+momentum update (keeps graph for meta-gradients)."""
         idx = 0
+        new_params: List[torch.Tensor] = []
         for i, p in enumerate(self.params):
             n = p.numel()
             g = grad_flat[idx:idx+n].view_as(p)
-            self.m[i] = self.mom * self.m[i] + g
-            with torch.no_grad():
-                p.add_(-self.lr * self.m[i])
+            m_prev = self.m[i]
+            m_new = self.mom * m_prev + g
+            self.m[i] = m_new
+            new_p = p - self.lr * m_new
+            new_params.append(new_p)
             idx += n
+        # replace params in-place to keep external references valid
+        for i, new_p in enumerate(new_params):
+            self.params[i] = new_p
 
     def snapshot(self):
         w = [p.detach().clone() for p in self.params]
@@ -132,7 +138,7 @@ class MomentumInner:
         return w, m
 
     def restore(self, w_state, m_state):
-        for p, s in zip(self.params, w_state):
-            p.data.copy_(s)
+        for i in range(len(self.params)):
+            self.params[i] = w_state[i].detach().clone().requires_grad_(True)
         for i in range(len(self.m)):
-            self.m[i].data.copy_(m_state[i])
+            self.m[i] = m_state[i].detach().clone()
