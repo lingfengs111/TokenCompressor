@@ -1,0 +1,508 @@
+"""SASRec backbone with meta-patch and projection head."""
+
+import logging
+from typing import List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
+
+from backbones.patch import MetaPatch
+from backbones.modules import apply_head as apply_head_fn, head_parameters as head_parameters_fn, sequence_summary
+
+logger = logging.getLogger("train-sasrec-meta-patch")
+
+
+class CausalSelfAttention(nn.Module):
+    """Multi-head self-attention with causal mask."""
+
+    def __init__(self, hidden_units: int, num_heads: int, dropout_rate: float, use_flash_attention: bool = True):
+        super().__init__()
+        assert hidden_units % num_heads == 0
+
+        # Combined QKV projection
+        self.c_attn = nn.Linear(hidden_units, 3 * hidden_units)
+        # Output projection
+        self.c_proj = nn.Linear(hidden_units, hidden_units)
+        self.attn_dropout = nn.Dropout(dropout_rate)
+        self.resid_dropout = nn.Dropout(dropout_rate)
+        self.num_heads = num_heads
+        self.hidden_units = hidden_units
+        self.use_flash_attention = use_flash_attention
+        self._flash_fallback_warned = False
+
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, T, C = x.size()  # batch, sequence length, hidden units
+
+        # Calculate query, key, values for all heads in batch
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.hidden_units, dim=2)
+
+        # Reshape for multi-head attention
+        k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()  # (B, nh, T, hs)
+        q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()  # (B, nh, T, hs)
+        v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()  # (B, nh, T, hs)
+
+        # Causal self-attention (prefer flash when available; disable under forward AD)
+        try:
+            from torch.autograd import forward_ad
+
+            fwd_ad_enabled = forward_ad.is_enabled()
+        except Exception:
+            fwd_ad_enabled = False
+
+        use_causal = attn_mask is None
+        attn_bias = attn_mask
+
+        if q.is_cuda and self.use_flash_attention and not fwd_ad_enabled and attn_bias is None:
+            try:
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
+                )
+            except RuntimeError:
+                if not self._flash_fallback_warned:
+                    logger.warning("Flash attention failed; falling back to math kernel.")
+                    self._flash_fallback_warned = True
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=False, enable_mem_efficient=False, enable_math=True
+                ):
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_bias, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
+                    )
+        elif q.is_cuda:
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False, enable_mem_efficient=False, enable_math=True
+            ):
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_bias, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
+                )
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_bias, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
+
+        # Re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        # Output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
+class MLP(nn.Module):
+    """Multi-layer perceptron (feed-forward network)."""
+
+    def __init__(self, hidden_units: int, dropout_rate: float):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden_units, hidden_units)
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_units, hidden_units)
+        self.dropout2 = nn.Dropout(dropout_rate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.dropout1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        x = self.dropout2(x)
+        return x
+
+
+class TransformerBlock(nn.Module):
+    """Transformer block with pre-LN architecture."""
+
+    def __init__(self, hidden_units: int, num_heads: int, dropout_rate: float, use_flash_attention: bool = True):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(hidden_units, eps=1e-8)
+        self.attn = CausalSelfAttention(hidden_units, num_heads, dropout_rate, use_flash_attention=use_flash_attention)
+        self.ln_2 = nn.LayerNorm(hidden_units, eps=1e-8)
+        self.ffn = MLP(hidden_units, dropout_rate)
+
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Pre-LN: LayerNorm -> Sub-layer -> Residual
+        x = x + self.attn(self.ln_1(x), attn_mask=attn_mask)
+        x = x + self.ffn(self.ln_2(x))
+        return x
+
+
+class SASRec(nn.Module):
+    """Self-Attentive Sequential Recommendation model."""
+
+    def __init__(self, config, item_num: int):
+        super().__init__()
+
+        self.config = config  # Store config for later use
+        self.item_num = item_num
+        self.max_seq_length = config.max_seq_length
+        self.hidden_units = config.hidden_units
+        self.patch_len = config.patch_len
+        self.persrec_enable = bool(getattr(config, "persrec_enable", False))
+        self.persrec_num_tokens = int(getattr(config, "persrec_num_tokens", 0) or 0)
+        self.persrec_pretrain_len = int(getattr(config, "persrec_pretrain_len", 0) or 0)
+        self.persrec_recent_len = int(getattr(config, "persrec_recent_len", 0) or 0)
+
+        # Embedding layers
+        # +2 to reserve PAD=0 and UNK=1
+        self.item_emb = nn.Embedding(item_num + 2, config.hidden_units, padding_idx=0)
+        if self.persrec_enable:
+            if self.persrec_num_tokens <= 0:
+                raise ValueError("persrec_num_tokens must be > 0 when persrec_enable=True.")
+            if self.persrec_pretrain_len <= 0 or self.persrec_recent_len <= 0:
+                raise ValueError("persrec_pretrain_len/recent_len must be set when persrec_enable=True.")
+            if self.persrec_pretrain_len + self.persrec_recent_len != self.max_seq_length:
+                logger.warning(
+                    "PersRec lengths mismatch: pretrain(%s)+recent(%s) != max_seq_length(%s).",
+                    self.persrec_pretrain_len,
+                    self.persrec_recent_len,
+                    self.max_seq_length,
+                )
+            self.pos_emb = nn.Embedding(
+                config.max_seq_length + self.persrec_num_tokens + 1, config.hidden_units, padding_idx=0
+            )
+            self.persrec_tokens = nn.Parameter(
+                torch.randn(1, self.persrec_num_tokens, self.hidden_units)
+            )
+        else:
+            self.pos_emb = nn.Embedding(config.max_seq_length + 1, config.hidden_units, padding_idx=0)
+        self.emb_dropout = nn.Dropout(config.dropout_rate)
+
+        # Transformer blocks
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    config.hidden_units,
+                    config.num_heads,
+                    config.dropout_rate,
+                    use_flash_attention=config.use_flash_attention,
+                )
+                for _ in range(config.num_blocks)
+            ]
+        )
+
+        # Final layer norm
+        self.ln_f = nn.LayerNorm(config.hidden_units, eps=1e-8)
+
+        # Trainable projection head (only head is adapted in inner loop)
+        self.proj_linear = nn.Linear(config.hidden_units, config.hidden_units, bias=True)
+        self.proj_ln = nn.LayerNorm(config.hidden_units, eps=1e-8)
+
+        # Meta-patch module (outer loop)
+        self.meta_patch = MetaPatch(config)
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # Don't initialize padding_idx
+            if module.padding_idx is not None:
+                with torch.no_grad():
+                    module.weight[module.padding_idx].fill_(0)
+
+    def _freeze_backbone(self) -> None:
+        """Freeze the transformer body (backbone)."""
+        for p in self.item_emb.parameters():
+            p.requires_grad = False
+        for p in self.pos_emb.parameters():
+            p.requires_grad = False
+        for block in self.blocks:
+            for p in block.parameters():
+                p.requires_grad = False
+        for p in self.ln_f.parameters():
+            p.requires_grad = False
+
+    def _sequence_summary(self, item_embs: torch.Tensor, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return last-item embedding and sequence lengths."""
+        pool = getattr(self.config, "gating_pool", "last")
+        return sequence_summary(item_embs, input_ids, pool=pool)
+
+    def _build_persrec_attention_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("Use _build_persrec_attention_mask_with_len instead.")
+
+    def _build_persrec_attention_mask_with_len(
+        self, input_ids: torch.Tensor, pretrain_len: int
+    ) -> torch.Tensor:
+        if not self.persrec_enable:
+            raise RuntimeError("PersRec attention mask requested but persrec is disabled.")
+        if self.persrec_num_tokens <= 0:
+            raise RuntimeError("PersRec requires persrec_num_tokens > 0.")
+        device = input_ids.device
+        dtype = self.item_emb.weight.dtype
+        batch_size, seq_len = input_ids.size()
+        total_len = seq_len + self.persrec_num_tokens
+
+        item_valid = input_ids != 0
+        token_valid = torch.ones((batch_size, self.persrec_num_tokens), device=device, dtype=torch.bool)
+        valid = torch.cat(
+            [
+                item_valid[:, : pretrain_len],
+                token_valid,
+                item_valid[:, pretrain_len :],
+            ],
+            dim=1,
+        )
+
+        base = torch.tril(torch.ones((total_len, total_len), device=device, dtype=torch.bool))
+        mask = base.unsqueeze(0).unsqueeze(1)
+        mask = mask & valid.unsqueeze(1).unsqueeze(2)
+        mask = mask & valid.unsqueeze(1).unsqueeze(3)
+
+        pre_end = pretrain_len - 1
+        recent_start = pretrain_len + self.persrec_num_tokens
+        if recent_start < total_len and pre_end >= 0:
+            mask[:, :, recent_start:, : pre_end + 1] = False
+
+        attn_bias = torch.where(mask, 0.0, torch.finfo(dtype).min)
+        return attn_bias
+
+    def _build_persrec_embeddings(
+        self, item_embs: torch.Tensor, input_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_length = input_ids.size()
+        pretrain_len, _ = self._resolve_persrec_lengths(seq_length)
+        if self.persrec_pretrain_len + self.persrec_recent_len != seq_length:
+            logger.warning(
+                "PersRec expects seq_len=%s (pretrain=%s + recent=%s) but got %s; using pretrain_len=%s.",
+                self.persrec_pretrain_len + self.persrec_recent_len,
+                self.persrec_pretrain_len,
+                self.persrec_recent_len,
+                seq_length,
+                pretrain_len,
+            )
+
+        positions = torch.arange(1, seq_length + 1, dtype=torch.long, device=input_ids.device)
+        positions = positions.unsqueeze(0).expand(batch_size, -1)
+        offset = 0
+        if getattr(self.config, "right_align_positions", True):
+            offset = max(self.max_seq_length - seq_length, 0)
+            if offset > 0:
+                positions = positions + offset
+        positions = positions * (input_ids != 0).long()
+
+        if self.persrec_num_tokens > 0:
+            recent_pos = positions[:, pretrain_len :]
+            recent_pos = torch.where(recent_pos > 0, recent_pos + self.persrec_num_tokens, recent_pos)
+            positions = torch.cat(
+                [positions[:, : pretrain_len], recent_pos], dim=1
+            )
+
+        pos_embs = self.pos_emb(positions)
+        item_with_pos = item_embs + pos_embs
+
+        token_positions = (
+            torch.arange(1, self.persrec_num_tokens + 1, dtype=torch.long, device=input_ids.device)
+            + offset
+            + pretrain_len
+        )
+        token_positions = token_positions.unsqueeze(0).expand(batch_size, -1)
+        token_embs = self.persrec_tokens.expand(batch_size, -1, -1) + self.pos_emb(token_positions)
+
+        pre = item_with_pos[:, : pretrain_len, :]
+        recent = item_with_pos[:, pretrain_len :, :]
+        hidden_states = torch.cat([pre, token_embs, recent], dim=1)
+        attn_mask = self._build_persrec_attention_mask_with_len(input_ids, pretrain_len)
+        return hidden_states, attn_mask
+
+    def _resolve_persrec_lengths(self, seq_length: int) -> Tuple[int, int]:
+        recent_len = min(self.persrec_recent_len, seq_length)
+        pretrain_len = max(seq_length - recent_len, 0)
+        return pretrain_len, recent_len
+
+    def head_parameters(self) -> List[torch.Tensor]:
+        return head_parameters_fn(self.config, self.proj_linear, self.proj_ln)
+
+    def apply_head(self, hidden_states: torch.Tensor, head_params: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+        return apply_head_fn(hidden_states, self.config, self.proj_linear, self.proj_ln, head_params=head_params)
+
+    def forward_features(
+        self,
+        input_ids: torch.Tensor,
+        patch_params: Optional[torch.Tensor] = None,
+        return_gating: bool = False,
+        use_patch: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]] | torch.Tensor:
+        """
+        Forward pass for feature extraction.
+
+        Args:
+            input_ids: Item sequences [batch_size, seq_length]
+
+        Returns:
+            Hidden states [batch_size, seq_length, hidden_units]
+        """
+        batch_size, seq_length = input_ids.size()
+
+        # Item embeddings
+        item_embs = self.item_emb(input_ids)
+        item_embs *= self.hidden_units**0.5  # Scale by sqrt(d) as in Transformer
+
+        # Patch embeddings (meta-patch)
+        seq_summary, _ = self._sequence_summary(item_embs, input_ids)
+        if use_patch and self.patch_len > 0:
+            if patch_params is None:
+                patch_emb, gating_weights = self.meta_patch(seq_summary)
+            else:
+                patch_emb, gating_weights = self.meta_patch.forward_with_eta(seq_summary, patch_params)
+        else:
+            patch_emb = item_embs.new_zeros((batch_size, 0, self.hidden_units))
+            gating_weights = None
+
+        attn_mask = None
+        if self.persrec_enable:
+            if use_patch and self.patch_len > 0:
+                raise ValueError("PersRec is not supported together with meta-patch in this implementation.")
+            hidden_states, attn_mask = self._build_persrec_embeddings(item_embs, input_ids)
+        else:
+            # Positional embeddings
+            positions = torch.arange(1, seq_length + 1, dtype=torch.long, device=input_ids.device)
+            positions = positions.unsqueeze(0).expand(batch_size, -1)
+            if getattr(self.config, "right_align_positions", True):
+                offset = max(self.max_seq_length - seq_length, 0)
+                if offset > 0:
+                    positions = positions + offset
+            positions = positions * (input_ids != 0).long()
+
+            if use_patch and self.patch_len > 0:
+                pos_embs_item = self.pos_emb(positions)
+                hidden_states = torch.cat([patch_emb, item_embs + pos_embs_item], dim=1)
+            else:
+                pos_embs = self.pos_emb(positions)
+                hidden_states = item_embs + pos_embs
+
+        hidden_states = self.emb_dropout(hidden_states)
+
+        # Pass through transformer blocks
+        for block in self.blocks:
+            if self.config.use_gradient_checkpointing and self.training and hidden_states.requires_grad:
+                hidden_states = gradient_checkpoint(block, hidden_states, attn_mask)
+            else:
+                hidden_states = block(hidden_states, attn_mask=attn_mask)
+
+        # Final layer norm
+        hidden_states = self.ln_f(hidden_states)
+
+        if return_gating:
+            return hidden_states, gating_weights
+        return hidden_states
+
+    def get_gating_weights(
+        self, input_ids: torch.Tensor, patch_params: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        item_embs = self.item_emb(input_ids)
+        seq_summary, _ = self._sequence_summary(item_embs, input_ids)
+        if patch_params is None:
+            _, weights = self.meta_patch(seq_summary)
+        else:
+            _, weights = self.meta_patch.forward_with_eta(seq_summary, patch_params)
+        return weights
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        pos_ids: Optional[torch.Tensor] = None,
+        neg_ids: Optional[torch.Tensor] = None,
+        patch_params: Optional[torch.Tensor] = None,
+        return_gating: bool = False,
+        use_patch: bool = True,
+    ):
+        if pos_ids is not None and neg_ids is not None:
+            return self.training_step(
+                input_ids,
+                pos_ids,
+                neg_ids,
+                patch_params=patch_params,
+                return_gating=return_gating,
+                use_patch=use_patch,
+            )
+        return self.forward_features(
+            input_ids,
+            patch_params=patch_params,
+            return_gating=return_gating,
+            use_patch=use_patch,
+        )
+
+    def predict(
+        self,
+        input_ids: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        patch_params: Optional[torch.Tensor] = None,
+        head_params: Optional[List[torch.Tensor]] = None,
+        use_patch: bool = True,
+        use_head: bool = True,
+    ) -> torch.Tensor:
+        """
+        Predict scores for candidate items.
+
+        Args:
+            input_ids: Item sequences [batch_size, seq_length]
+            candidate_ids: Candidate items to score [batch_size, num_candidates]
+
+        Returns:
+            Scores for each candidate [batch_size, num_candidates]
+        """
+        hidden_states = self.forward_features(input_ids, patch_params=patch_params, use_patch=use_patch)
+        if use_patch and self.patch_len > 0:
+            hidden_states = hidden_states[:, self.patch_len :, :]
+        if self.persrec_enable and self.persrec_num_tokens > 0:
+            pre, _ = self._resolve_persrec_lengths(input_ids.size(1))
+            k = self.persrec_num_tokens
+            hidden_states = torch.cat([hidden_states[:, :pre, :], hidden_states[:, pre + k :, :]], dim=1)
+        final_hidden = hidden_states[:, -1, :]  # [B, H]
+        if use_head:
+            final_hidden = self.apply_head(final_hidden, head_params=head_params)
+        candidate_embs = self.item_emb(candidate_ids)  # [B, C, H]
+        scores = torch.bmm(candidate_embs, final_hidden.unsqueeze(-1)).squeeze(-1)  # [B, C]
+        return scores
+
+    def training_step(
+        self,
+        input_ids: torch.Tensor,
+        pos_ids: torch.Tensor,
+        neg_ids: torch.Tensor,
+        patch_params: Optional[torch.Tensor] = None,
+        head_params: Optional[List[torch.Tensor]] = None,
+        return_gating: bool = False,
+        use_patch: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Training step with positive and negative items.
+
+        Args:
+            input_ids: Item sequences [batch_size, seq_length]
+            pos_ids: Positive items (next items) [batch_size, seq_length]
+            neg_ids: Negative items (sampled) [batch_size, seq_length]
+
+        Returns:
+            pos_logits: Scores for positive items [batch_size, seq_length]
+            neg_logits: Scores for negative items [batch_size, seq_length]
+        """
+        hidden_states, gating_weights = self.forward_features(
+            input_ids, patch_params=patch_params, return_gating=True, use_patch=use_patch
+        )
+        if use_patch and self.patch_len > 0:
+            hidden_states = hidden_states[:, self.patch_len :, :]
+        if self.persrec_enable and self.persrec_num_tokens > 0:
+            pre, _ = self._resolve_persrec_lengths(input_ids.size(1))
+            k = self.persrec_num_tokens
+            hidden_states = torch.cat([hidden_states[:, :pre, :], hidden_states[:, pre + k :, :]], dim=1)
+
+        projected = self.apply_head(hidden_states, head_params=head_params)
+        pos_embs = self.item_emb(pos_ids)  # [B, T, H]
+        neg_embs = self.item_emb(neg_ids)  # [B, T, H] or [B, T, K, H]
+
+        pos_logits = (projected * pos_embs).sum(dim=-1)  # [B, T]
+        if neg_embs.dim() == 4:
+            neg_logits = (projected.unsqueeze(2) * neg_embs).sum(dim=-1)  # [B, T, K]
+        else:
+            neg_logits = (projected * neg_embs).sum(dim=-1)  # [B, T]
+
+        if return_gating:
+            return pos_logits, neg_logits, gating_weights
+        return pos_logits, neg_logits

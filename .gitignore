@@ -9,6 +9,13 @@ artifacts/
 data/*
 !data/movielens1m/
 
+# 忽略本地开发与运行产物
+.vscode/
+logs/
+checkpoints/
+wandb/
+pic/
+
 # 忽略临时文件
 *.log
 *.tmp

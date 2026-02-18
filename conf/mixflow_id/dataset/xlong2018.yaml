@@ -1,0 +1,8 @@
+data_format: xlong_pair
+xlong_train_path: data/pure_id-based/xlong2018/train_corpus_total_dual.txt
+xlong_test_path: data/pure_id-based/xlong2018/test_corpus_total_dual.txt
+item_embeddings_path: data/pure_id-based/xlong2018/item_embeddings_sas128_len500.npy
+embeddings_have_pad: false
+L_recent: 50
+L_full: 500
+train_stride: 5

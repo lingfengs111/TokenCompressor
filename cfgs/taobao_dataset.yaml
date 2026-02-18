@@ -1,0 +1,91 @@
+# Snapshot of train_backbone_standard.py SASRecConfig defaults (taobao_loo202).
+# Values reflect effective defaults after __post_init__.
+
+# Data
+dataset: taobao_loo202
+data_dir: null
+data_txt_path: null
+checkpoint_dir: /home/lingfengs111/codes/soft_patch_training/checkpoints
+
+# Model (shared)
+backbone: sasrec
+max_seq_length: 200
+hidden_units: 128
+num_blocks: 2
+num_heads: 1
+dropout_rate: 0.1
+right_align_positions: true
+initializer_range: 0.02
+
+# SASRec-specific
+use_flash_attention: true
+use_gradient_checkpointing: false
+
+# FMLP-specific
+fmlp_num_layers: 2
+fmlp_num_heads: 2
+fmlp_hidden_dropout: 0.1
+fmlp_attn_dropout: 0.1
+fmlp_hidden_act: gelu
+fmlp_no_filters: false
+
+# LinRec-specific
+linrec_num_layers: 2
+linrec_num_heads: 1
+linrec_inner_size: 512
+linrec_hidden_dropout: 0.1
+linrec_attn_dropout: 0.1
+linrec_hidden_act: gelu
+linrec_layer_norm_eps: 1.0e-12
+linrec_hidden_dropout_override: 0.15
+linrec_attn_dropout_override: 0.15
+linrec_max_learning_rate: 3.0e-4
+linrec_min_learning_rate: 5.0e-6
+linrec_weight_decay: 5.0e-3
+linrec_grad_clip: 1.0
+linrec_early_stop_patience: 5
+
+# Bert4Rec-specific
+bert_num_layers: 2
+bert_num_heads: 1
+bert_dropout: 0.1
+
+# GRU4Rec-specific
+gru_embedding_size: 128
+gru_num_layers: 1
+gru_dropout: 0.1
+
+# LRU-specific
+lru_num_blocks: 2
+lru_dropout: 0.1
+lru_attn_dropout: 0.1
+
+# Head (shared)
+enable_projection_head: false
+head_use_gelu: false
+head_use_ln: true
+head_residual: false
+
+# Training parameters
+batch_size: 1024
+num_epochs: 200
+max_learning_rate: 1.0e-3
+min_learning_rate: 1.0e-5
+weight_decay: 0.0
+grad_clip: 0.0
+
+# Training settings
+scheduler_type: cosine
+warmup_steps: 100
+warmup_start_lr: 1.0e-8
+steps_per_train_log: 100
+steps_per_val_log: 300
+eval_sample_size: 1000
+early_stop_patience: 0
+
+# Output settings
+save_item_embeddings: true
+run_tag: null
+
+# Device settings
+device: cuda:1

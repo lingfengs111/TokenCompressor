@@ -1,0 +1,6 @@
+hydra:
+  run:
+    dir: .
+  sweep:
+    dir: ./multirun
+  output_subdir: null

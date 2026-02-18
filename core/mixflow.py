@@ -73,6 +73,9 @@ def get_fwdrev_grad_fn_eta(inner_loss_fn):
             theta_flat, eta = saved[0], saved[1]
             rest_tensors = saved[2:2+ctx.n_rest]
             shapes = ctx.theta_shapes
+            if ct.numel() != theta_flat.numel():
+                raise RuntimeError(f"FwdRev backward expected ct.numel()=={theta_flat.numel()}, got {ct.numel()}")
+            ct_flat = ct.reshape_as(theta_flat)
             theta = _unflatten(theta_flat, shapes)
 
             # --- efficient HVP: JVP on grad_theta (wrt theta) ---
@@ -80,7 +83,7 @@ def get_fwdrev_grad_fn_eta(inner_loss_fn):
                 return torch.func.grad(inner_loss_fn, argnums=0)(th_list, eta, *rest_tensors)
 
             # split ct to match theta
-            split = _unflatten(ct, shapes)
+            split = _unflatten(ct_flat, shapes)
             _, hvp_theta_list = torch.func.jvp(grad_theta_only, (tuple(theta),), (tuple(split),))
             flat_hvp_theta = torch.cat([h.reshape(-1) for h in hvp_theta_list])
 
@@ -89,7 +92,13 @@ def get_fwdrev_grad_fn_eta(inner_loss_fn):
                 theta_req = [t.detach().requires_grad_(True) for t in theta]
                 grads = torch.func.grad(inner_loss_fn, argnums=0)(theta_req, eta, *rest_tensors)
                 grad_theta_flat = torch.cat([g.reshape(-1) for g in grads])
-                hvp_eta = torch.autograd.grad(grad_theta_flat, eta, grad_outputs=ct, retain_graph=False, allow_unused=False)[0]
+                if grad_theta_flat.numel() != ct_flat.numel():
+                    raise RuntimeError(
+                        f"grad_theta_flat.numel()=={grad_theta_flat.numel()} does not match ct.numel()=={ct_flat.numel()}"
+                    )
+                # safer: explicit inner product to avoid grad_outputs edge cases across PyTorch versions
+                s = (grad_theta_flat * ct_flat).sum()
+                hvp_eta = torch.autograd.grad(s, eta, retain_graph=False, allow_unused=False)[0]
 
             grad_rest = tuple([None for _ in rest_tensors])
             # Return grads for inputs of forward in order:
