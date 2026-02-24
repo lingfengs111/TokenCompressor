@@ -34,6 +34,7 @@ class MetaPatch(nn.Module):
         gate_init = torch.randn(self.gate_param_size) * config.gating_init_std
         self.eta = nn.Parameter(torch.cat([patch_init, gate_init], dim=0))
         self.register_buffer("kmeans_centers", torch.empty(0), persistent=False)
+        self.register_buffer("user_to_patch", torch.empty(0, dtype=torch.long), persistent=False)
 
     def set_kmeans_centers(self, centers: torch.Tensor) -> None:
         if centers.dim() != 2 or centers.size(1) != self.hidden_units:
@@ -47,15 +48,22 @@ class MetaPatch(nn.Module):
                 centers = centers[: self.num_patches]
         self.kmeans_centers = centers.to(device=self.eta.device, dtype=self.eta.dtype)
 
+    def set_user_table(self, user_to_patch: torch.Tensor) -> None:
+        if user_to_patch.dim() != 1:
+            raise ValueError("user_to_patch must be a 1D tensor of patch indices.")
+        self.user_to_patch = user_to_patch.to(device=self.eta.device, dtype=torch.long)
+
     def _split_eta(self, eta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         patch_flat = eta[: self.patch_param_size]
         gate_flat = eta[self.patch_param_size :]
         return patch_flat, gate_flat
 
-    def forward(self, seq_emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_with_eta(seq_emb, self.eta)
+    def forward(self, seq_emb: torch.Tensor, user_ids: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_with_eta(seq_emb, self.eta, user_ids=user_ids)
 
-    def forward_with_eta(self, seq_emb: torch.Tensor, eta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_with_eta(
+        self, seq_emb: torch.Tensor, eta: torch.Tensor, user_ids: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.patch_len == 0:
             empty_patch = seq_emb.new_zeros((seq_emb.size(0), 0, self.hidden_units))
             empty_weights = seq_emb.new_zeros((seq_emb.size(0), self.num_patches))
@@ -81,6 +89,15 @@ class MetaPatch(nn.Module):
                 dist = torch.cdist(seq_emb, centers)
                 idx = dist.argmin(dim=1)
                 weights = F.one_hot(idx, num_classes=self.num_patches).to(seq_emb.dtype)
+            elif routing == "user_table":
+                if self.user_to_patch.numel() == 0:
+                    raise RuntimeError("User-table routing requested but user_to_patch is not set.")
+                if user_ids is None:
+                    raise RuntimeError("User-table routing requires user_ids.")
+                if user_ids.device != self.user_to_patch.device:
+                    user_ids = user_ids.to(self.user_to_patch.device)
+                idx = self.user_to_patch[user_ids]
+                weights = F.one_hot(idx, num_classes=self.num_patches).to(seq_emb.dtype).to(seq_emb.device)
             else:
                 raise ValueError(f"Unknown patch_routing: {routing}")
             patch = torch.einsum("bp,plh->blh", weights, patch_bank)

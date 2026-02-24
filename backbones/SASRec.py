@@ -14,6 +14,23 @@ from backbones.modules import apply_head as apply_head_fn, head_parameters as he
 logger = logging.getLogger("train-sasrec-meta-patch")
 
 
+def _sdpa_kernel_context(enable_flash: bool, enable_mem_efficient: bool, enable_math: bool):
+    try:
+        from torch.nn.attention import sdpa_kernel
+
+        return sdpa_kernel(
+            enable_flash=enable_flash,
+            enable_mem_efficient=enable_mem_efficient,
+            enable_math=enable_math,
+        )
+    except Exception:
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=enable_flash,
+            enable_mem_efficient=enable_mem_efficient,
+            enable_math=enable_math,
+        )
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head self-attention with causal mask."""
 
@@ -64,16 +81,12 @@ class CausalSelfAttention(nn.Module):
                 if not self._flash_fallback_warned:
                     logger.warning("Flash attention failed; falling back to math kernel.")
                     self._flash_fallback_warned = True
-                with torch.backends.cuda.sdp_kernel(
-                    enable_flash=False, enable_mem_efficient=False, enable_math=True
-                ):
+                with _sdpa_kernel_context(enable_flash=False, enable_mem_efficient=False, enable_math=True):
                     y = F.scaled_dot_product_attention(
                         q, k, v, attn_mask=attn_bias, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
                     )
         elif q.is_cuda:
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=False, enable_mem_efficient=False, enable_math=True
-            ):
+            with _sdpa_kernel_context(enable_flash=False, enable_mem_efficient=False, enable_math=True):
                 y = F.scaled_dot_product_attention(
                     q, k, v, attn_mask=attn_bias, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
                 )
@@ -324,6 +337,7 @@ class SASRec(nn.Module):
     def forward_features(
         self,
         input_ids: torch.Tensor,
+        user_ids: Optional[torch.Tensor] = None,
         patch_params: Optional[torch.Tensor] = None,
         return_gating: bool = False,
         use_patch: bool = True,
@@ -347,9 +361,11 @@ class SASRec(nn.Module):
         seq_summary, _ = self._sequence_summary(item_embs, input_ids)
         if use_patch and self.patch_len > 0:
             if patch_params is None:
-                patch_emb, gating_weights = self.meta_patch(seq_summary)
+                patch_emb, gating_weights = self.meta_patch(seq_summary, user_ids=user_ids)
             else:
-                patch_emb, gating_weights = self.meta_patch.forward_with_eta(seq_summary, patch_params)
+                patch_emb, gating_weights = self.meta_patch.forward_with_eta(
+                    seq_summary, patch_params, user_ids=user_ids
+                )
         else:
             patch_emb = item_embs.new_zeros((batch_size, 0, self.hidden_units))
             gating_weights = None
@@ -363,7 +379,23 @@ class SASRec(nn.Module):
             # Positional embeddings
             positions = torch.arange(1, seq_length + 1, dtype=torch.long, device=input_ids.device)
             positions = positions.unsqueeze(0).expand(batch_size, -1)
-            if getattr(self.config, "right_align_positions", True):
+            prefix_len = int(getattr(self.config, "prefix_len", 0) or 0)
+            use_prefix_tail_pos = bool(getattr(self.config, "prefix_tail_positions", False))
+            if use_prefix_tail_pos and prefix_len > 0 and seq_length <= self.max_seq_length:
+                prefix_len = min(prefix_len, seq_length)
+                tail_len = max(seq_length - prefix_len, 0)
+                pos_custom = torch.zeros_like(positions)
+                if prefix_len > 0:
+                    prefix_pos = torch.arange(1, prefix_len + 1, dtype=torch.long, device=input_ids.device)
+                    pos_custom[:, :prefix_len] = prefix_pos
+                if tail_len > 0:
+                    tail_start = max(self.max_seq_length - tail_len + 1, 1)
+                    tail_pos = torch.arange(
+                        tail_start, tail_start + tail_len, dtype=torch.long, device=input_ids.device
+                    )
+                    pos_custom[:, prefix_len:] = tail_pos
+                positions = pos_custom
+            elif getattr(self.config, "right_align_positions", True):
                 offset = max(self.max_seq_length - seq_length, 0)
                 if offset > 0:
                     positions = positions + offset
@@ -371,7 +403,16 @@ class SASRec(nn.Module):
 
             if use_patch and self.patch_len > 0:
                 pos_embs_item = self.pos_emb(positions)
-                hidden_states = torch.cat([patch_emb, item_embs + pos_embs_item], dim=1)
+                item_with_pos = item_embs + pos_embs_item
+                prefix_len = int(getattr(self.config, "prefix_len", 0) or 0)
+                patch_after_prefix = bool(getattr(self.config, "patch_after_prefix", False))
+                if patch_after_prefix and prefix_len > 0:
+                    prefix_len = min(prefix_len, seq_length)
+                    prefix_part = item_with_pos[:, :prefix_len, :]
+                    tail_part = item_with_pos[:, prefix_len:, :]
+                    hidden_states = torch.cat([prefix_part, patch_emb, tail_part], dim=1)
+                else:
+                    hidden_states = torch.cat([patch_emb, item_with_pos], dim=1)
             else:
                 pos_embs = self.pos_emb(positions)
                 hidden_states = item_embs + pos_embs
@@ -393,14 +434,17 @@ class SASRec(nn.Module):
         return hidden_states
 
     def get_gating_weights(
-        self, input_ids: torch.Tensor, patch_params: Optional[torch.Tensor] = None
+        self,
+        input_ids: torch.Tensor,
+        patch_params: Optional[torch.Tensor] = None,
+        user_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         item_embs = self.item_emb(input_ids)
         seq_summary, _ = self._sequence_summary(item_embs, input_ids)
         if patch_params is None:
-            _, weights = self.meta_patch(seq_summary)
+            _, weights = self.meta_patch(seq_summary, user_ids=user_ids)
         else:
-            _, weights = self.meta_patch.forward_with_eta(seq_summary, patch_params)
+            _, weights = self.meta_patch.forward_with_eta(seq_summary, patch_params, user_ids=user_ids)
         return weights
 
     def forward(
@@ -409,6 +453,7 @@ class SASRec(nn.Module):
         pos_ids: Optional[torch.Tensor] = None,
         neg_ids: Optional[torch.Tensor] = None,
         patch_params: Optional[torch.Tensor] = None,
+        user_ids: Optional[torch.Tensor] = None,
         return_gating: bool = False,
         use_patch: bool = True,
     ):
@@ -418,11 +463,13 @@ class SASRec(nn.Module):
                 pos_ids,
                 neg_ids,
                 patch_params=patch_params,
+                user_ids=user_ids,
                 return_gating=return_gating,
                 use_patch=use_patch,
             )
         return self.forward_features(
             input_ids,
+            user_ids=user_ids,
             patch_params=patch_params,
             return_gating=return_gating,
             use_patch=use_patch,
@@ -434,6 +481,7 @@ class SASRec(nn.Module):
         candidate_ids: torch.Tensor,
         patch_params: Optional[torch.Tensor] = None,
         head_params: Optional[List[torch.Tensor]] = None,
+        user_ids: Optional[torch.Tensor] = None,
         use_patch: bool = True,
         use_head: bool = True,
     ) -> torch.Tensor:
@@ -447,7 +495,9 @@ class SASRec(nn.Module):
         Returns:
             Scores for each candidate [batch_size, num_candidates]
         """
-        hidden_states = self.forward_features(input_ids, patch_params=patch_params, use_patch=use_patch)
+        hidden_states = self.forward_features(
+            input_ids, user_ids=user_ids, patch_params=patch_params, use_patch=use_patch
+        )
         if use_patch and self.patch_len > 0:
             hidden_states = hidden_states[:, self.patch_len :, :]
         if self.persrec_enable and self.persrec_num_tokens > 0:
@@ -468,6 +518,7 @@ class SASRec(nn.Module):
         neg_ids: torch.Tensor,
         patch_params: Optional[torch.Tensor] = None,
         head_params: Optional[List[torch.Tensor]] = None,
+        user_ids: Optional[torch.Tensor] = None,
         return_gating: bool = False,
         use_patch: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -484,7 +535,11 @@ class SASRec(nn.Module):
             neg_logits: Scores for negative items [batch_size, seq_length]
         """
         hidden_states, gating_weights = self.forward_features(
-            input_ids, patch_params=patch_params, return_gating=True, use_patch=use_patch
+            input_ids,
+            user_ids=user_ids,
+            patch_params=patch_params,
+            return_gating=True,
+            use_patch=use_patch,
         )
         if use_patch and self.patch_len > 0:
             hidden_states = hidden_states[:, self.patch_len :, :]

@@ -9,7 +9,9 @@ import random
 import argparse
 import csv
 import json
+import platform
 import re
+import secrets
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -24,6 +26,7 @@ except Exception:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 from torch.func import functional_call
 from tqdm import tqdm
 
@@ -168,6 +171,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train SASRec meta-patch with long/short adaptation.")
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--pretrained_ckpt_path", type=str, default=None)
     parser.add_argument("--max_seq_length", type=int, default=None)
     parser.add_argument("--inner_seq_length", type=int, default=None)
@@ -194,7 +198,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_meta", type=float, default=None)
     parser.add_argument("--outer_loss_mode", type=str, default=None)
     parser.add_argument("--outer_loss_decay", type=float, default=None)
+    parser.add_argument("--outer_distill", type=str, default=None)
+    parser.add_argument("--outer_distill_temperature", type=float, default=None)
+    parser.add_argument("--outer_neg_samples", type=int, default=None)
+    parser.add_argument("--outer_tail_weight", type=float, default=None)
+    parser.add_argument("--outer_mid_weight", type=float, default=None)
+    parser.add_argument("--outer_mid_samples", type=int, default=None)
     parser.add_argument("--inner_loss_mode", type=str, default=None)
+    parser.add_argument("--prefix_len", type=int, default=None)
+    parser.add_argument("--prefix_tail_positions", type=_str2bool, default=None)
+    parser.add_argument("--patch_after_prefix", type=_str2bool, default=None)
+    parser.add_argument("--inner_drop_prefix", type=_str2bool, default=None)
+    parser.add_argument("--inner_reset_every", type=int, default=None)
 
     # Patch/Gating
     parser.add_argument("--num_patches", type=int, default=None)
@@ -212,6 +227,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_sample_size", type=int, default=None)
     parser.add_argument("--steps_per_train_log", type=int, default=None)
     parser.add_argument("--save_best_model", type=_str2bool, default=None)
+    parser.add_argument("--eval_before_train", type=_str2bool, default=None)
+    parser.add_argument("--eval_after_train", type=_str2bool, default=None)
+    parser.add_argument("--checkpoint_mode", type=str, default=None)
+    parser.add_argument("--run_tag", type=str, default=None)
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--prefetch_factor", type=int, default=None)
+    parser.add_argument("--persistent_workers", type=_str2bool, default=None)
+    parser.add_argument("--pin_memory", type=_str2bool, default=None)
     parser.add_argument("--enable_timing", type=_str2bool, default=None)
     parser.add_argument("--timing_window", type=int, default=None)
 
@@ -270,7 +293,7 @@ class SASRecConfig:
     dataset: str = "taobao_loo202"
     data_dir: Optional[Path] = None
     data_txt_path: Optional[Path] = None
-    checkpoint_dir: Path = field(default_factory=lambda: Path("checkpoints") / "sasrec")
+    checkpoint_dir: Path = field(default_factory=lambda: Path(ROOT_DIR) / "checkpoints")
 
     # Model parameters
     backbone: str = "sasrec"  # sasrec | fmlp | linrec | bert4rec | gru4rec
@@ -304,7 +327,7 @@ class SASRecConfig:
     gating_temperature: float = 0.5  # Softmax temperature (<1 sharpens)
     gating_noise_std: float = 0.01  # Logit noise for symmetry breaking
     
-    patch_routing: str = "learned"  # learned | kmeans | random | single
+    patch_routing: str = "learned"  # learned | kmeans | user_table | random | single
     kmeans_max_iters: int = 25
     kmeans_seed: int = 2026
     kmeans_max_samples: int = 20000
@@ -330,7 +353,18 @@ class SASRecConfig:
     val_eval_every_epochs: int = 4  # Run meta-patch eval on val every N epochs
     outer_loss_mode: str = "decay"  # all | last | decay
     outer_loss_decay: float = 0.9  # decay factor for outer loss when mode=decay
+    outer_distill: str = "kl"  # kl | soft_bce | mse
+    outer_distill_temperature: float = 1.0  # temperature for distillation
+    outer_neg_samples: int = 1  # number of negative samples for outer distillation
+    outer_tail_weight: float = 1.0  # weight for tail distillation (0 disables)
+    outer_mid_weight: float = 1.0  # weight for middle-segment distillation (0 disables)
+    outer_mid_samples: int = 0  # number of middle positions to distill (0 => patch_len)
     inner_loss_mode: str = "match_outer"  # match_outer | all | last | decay
+    prefix_len: int = 5  # number of prefix tokens to retain in short-view inputs
+    prefix_tail_positions: bool = True  # align prefix to start and tail to end positions
+    patch_after_prefix: bool = True  # insert patch between prefix and tail when prefix_len>0
+    inner_drop_prefix: bool = True  # drop prefix in inner loop (tail + patch only)
+    inner_reset_every: int = 0  # reset inner parameters every N steps (0 disables)
     
 
     # Unseen item handling
@@ -353,6 +387,13 @@ class SASRecConfig:
     eval_sample_size: int = 1000  # Total candidates per user when eval_mode="sampled" (includes target)
     use_gradient_checkpointing: bool = False  # Enable gradient checkpointing (memory fallback)
     use_flash_attention: bool = False  # Disable flash attention (use math kernel)
+    eval_before_train: bool = False  # Run baseline/meta eval before training
+    eval_after_train: bool = True  # Run val eval after training
+    # DataLoader settings (vectorized batch building)
+    num_workers: int = 0
+    prefetch_factor: int = 2
+    persistent_workers: bool = False
+    pin_memory: bool = True
     enable_timing: bool = False  # Log timing breakdowns for profiling
     timing_window: int = 50  # Number of steps per timing average
 
@@ -363,6 +404,8 @@ class SASRecConfig:
     # Output settings
     save_item_embeddings: bool = False  # Save item embeddings after training
     save_best_model: bool = True  # Save best val model for test evaluation
+    checkpoint_mode: str = "full"  # full | delta
+    run_tag: Optional[str] = None  # Unique run folder suffix (timestamp + run id)
 
     # Device settings
     device: str = "cuda:1"  # e.g., "cuda:1", "cpu", "mps"
@@ -445,7 +488,18 @@ class SASRecConfig:
         logger.info(f"  val_eval_every_epochs: {self.val_eval_every_epochs}")
         logger.info(f"  outer_loss_mode: {self.outer_loss_mode}")
         logger.info(f"  outer_loss_decay: {self.outer_loss_decay}")
+        logger.info(f"  outer_distill: {self.outer_distill}")
+        logger.info(f"  outer_distill_temperature: {self.outer_distill_temperature}")
+        logger.info(f"  outer_neg_samples: {self.outer_neg_samples}")
+        logger.info(f"  outer_tail_weight: {self.outer_tail_weight}")
+        logger.info(f"  outer_mid_weight: {self.outer_mid_weight}")
+        logger.info(f"  outer_mid_samples: {self.outer_mid_samples}")
         logger.info(f"  inner_loss_mode: {self.inner_loss_mode}")
+        logger.info(f"  prefix_len: {self.prefix_len}")
+        logger.info(f"  prefix_tail_positions: {self.prefix_tail_positions}")
+        logger.info(f"  patch_after_prefix: {self.patch_after_prefix}")
+        logger.info(f"  inner_drop_prefix: {self.inner_drop_prefix}")
+        logger.info(f"  inner_reset_every: {self.inner_reset_every}")
         logger.info(f"  inner_unk_mask_prob: {self.inner_unk_mask_prob}")
         logger.info(f"  drop_unseen_items: {self.drop_unseen_items}")
         logger.info(f"  inner_train_bias_ln: {self.inner_train_bias_ln}")
@@ -457,6 +511,13 @@ class SASRecConfig:
         logger.info(f"  meta_test_unk_mask_prob: {self.meta_test_unk_mask_prob}")
         logger.info(f"  use_gradient_checkpointing: {self.use_gradient_checkpointing}")
         logger.info(f"  use_flash_attention: {self.use_flash_attention}")
+        logger.info(f"  eval_before_train: {self.eval_before_train}")
+        logger.info(f"  eval_after_train: {self.eval_after_train}")
+        logger.info("DataLoader Settings:")
+        logger.info(f"  num_workers: {self.num_workers}")
+        logger.info(f"  prefetch_factor: {self.prefetch_factor}")
+        logger.info(f"  persistent_workers: {self.persistent_workers}")
+        logger.info(f"  pin_memory: {self.pin_memory}")
         logger.info(f"  enable_timing: {self.enable_timing}")
         logger.info(f"  timing_window: {self.timing_window}")
         logger.info(f"  strict_load_pretrained: {self.strict_load_pretrained}")
@@ -465,6 +526,8 @@ class SASRecConfig:
         logger.info("Output Settings:")
         logger.info(f"  save_item_embeddings: {self.save_item_embeddings}")
         logger.info(f"  save_best_model: {self.save_best_model}")
+        logger.info(f"  checkpoint_mode: {self.checkpoint_mode}")
+        logger.info(f"  run_tag: {self.run_tag}")
 
         logger.info("Device Settings:")
         logger.info(f"  device: {self.device}")
@@ -479,6 +542,155 @@ def _extract_state_dict(ckpt: Dict) -> Dict[str, torch.Tensor]:
         if key in ckpt and isinstance(ckpt[key], dict):
             return ckpt[key]
     return ckpt
+
+
+def _jsonify(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return value.item()
+        return None
+    if isinstance(value, dict):
+        return {k: _jsonify(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify(v) for v in value]
+    return value
+
+
+def _serialize_config(config: SASRecConfig) -> Dict[str, Any]:
+    raw = dict(config.__dict__)
+    return {k: _jsonify(v) for k, v in raw.items()}
+
+
+def build_checkpoint_tag(config: SASRecConfig) -> str:
+    backbone = str(config.backbone).lower()
+    gate_tag = "nogate"
+    if config.use_gating:
+        gate_tag = f"gate{str(config.gating_pool).lower()}"
+    route_tag = f"route{str(config.patch_routing).lower()}"
+    return (
+        f"{backbone}_{config.dataset}_short{config.inner_seq_length}_long{config.max_seq_length}"
+        f"_dim{config.hidden_units}_L{config.num_blocks}_H{config.num_heads}"
+        f"_P{config.patch_len}x{config.num_patches}_{gate_tag}_{route_tag}"
+    )
+
+
+def _collect_trainable_state_dict(model: nn.Module) -> Tuple[Dict[str, torch.Tensor], List[str]]:
+    trainable = {name for name, p in model.named_parameters() if p.requires_grad}
+    state = model.state_dict()
+    delta_state = {k: v for k, v in state.items() if k in trainable}
+    return delta_state, sorted(trainable)
+
+
+def _build_run_tag(config: SASRecConfig, run: Optional[Any]) -> str:
+    if config.run_tag:
+        return str(config.run_tag)
+    run_id = None
+    if run is not None:
+        run_id = getattr(run, "id", None) or getattr(wandb.run, "id", None)
+    tag = time.strftime("%Y%m%d_%H%M%S")
+    suffix = run_id or secrets.token_hex(4)
+    return f"{tag}-{suffix}"
+
+
+def _format_run_float(val: float) -> str:
+    if val is None:
+        return "na"
+    if abs(val - int(val)) < 1e-6:
+        return str(int(val))
+    text = f"{val:.3g}"
+    return text.replace(".", "p")
+
+
+def _build_run_name(config: SASRecConfig) -> str:
+    base = (
+        f"{config.backbone}-meta-patch-{config.dataset}-L{config.num_blocks}-H{config.hidden_units}"
+        f"-P{config.num_patches}x{config.patch_len}"
+        f"-short{config.inner_seq_length}-long{config.max_seq_length}"
+    )
+    suffix = []
+    sweep_id = os.getenv("WANDB_SWEEP_ID")
+    if sweep_id:
+        suffix.append(f"sw{sweep_id[:4]}")
+    suffix.append(f"route{str(config.patch_routing).lower()}")
+    suffix.append(f"pref{config.prefix_len}")
+    suffix.append("peT" if config.prefix_tail_positions else "peF")
+    suffix.append("papT" if config.patch_after_prefix else "papF")
+    if config.inner_drop_prefix:
+        suffix.append("idp")
+    if getattr(config, "inner_reset_every", 0):
+        suffix.append(f"ir{config.inner_reset_every}")
+    suffix.append(f"tw{_format_run_float(float(getattr(config, 'outer_tail_weight', 1.0)))}")
+    suffix.append(f"mw{_format_run_float(float(getattr(config, 'outer_mid_weight', 0.0)))}")
+    return base + "-" + "-".join(suffix)
+
+
+def save_run_config(
+    config: SASRecConfig,
+    run_name: str,
+    argv: List[str],
+) -> Optional[Path]:
+    try:
+        payload = _serialize_config(config)
+        payload.update(
+            {
+                "run_name": run_name,
+                "argv": list(argv),
+                "cwd": os.getcwd(),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+        out_path = config.checkpoint_dir / "config.json"
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True, indent=2)
+        return out_path
+    except Exception as exc:
+        logger.warning("Failed to write config.json: %s", exc)
+        return None
+
+
+def save_run_summary(
+    config: SASRecConfig,
+    run_name: str,
+    best_metrics: Dict[str, float],
+    baseline_metrics: Dict[str, float],
+    meta_metrics: Dict[str, float],
+    best_ckpt_path: Optional[Path],
+    metrics_jsonl: Optional[Path] = None,
+    metrics_csv: Optional[Path] = None,
+) -> Optional[Path]:
+    try:
+        payload = {
+            "run_name": run_name,
+            "run_tag": config.run_tag,
+            "checkpoint_dir": str(config.checkpoint_dir),
+            "checkpoint_tag": build_checkpoint_tag(config),
+            "best_ckpt_path": str(best_ckpt_path) if best_ckpt_path else None,
+            "best_val": _jsonify(best_metrics),
+            "test": {
+                "baseline": _jsonify(baseline_metrics),
+                "meta_patch": _jsonify(meta_metrics),
+            },
+            "metrics_jsonl": str(metrics_jsonl) if metrics_jsonl else None,
+            "metrics_csv": str(metrics_csv) if metrics_csv else None,
+            "env": {
+                "python": sys.version.split()[0],
+                "platform": platform.platform(),
+                "torch": torch.__version__,
+                "cuda": torch.version.cuda,
+            },
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        out_path = config.checkpoint_dir / "summary.json"
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True, indent=2)
+        return out_path
+    except Exception as exc:
+        logger.warning("Failed to write summary.json: %s", exc)
+        return None
 
 
 def load_checkpoint(path: str, trust_pickle: bool = True) -> Dict:
@@ -728,23 +940,27 @@ def sasrec_training_step_stateless(
     input_ids: torch.Tensor,
     pos_ids: torch.Tensor,
     neg_ids: torch.Tensor,
+    user_ids: Optional[torch.Tensor] = None,
     return_gating: bool = False,
     use_patch: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     override = build_override(theta_names, theta_list)
     params = {**base_params, **override, **base_buffers}
+    kwargs = {
+        "input_ids": input_ids,
+        "pos_ids": pos_ids,
+        "neg_ids": neg_ids,
+        "patch_params": eta,
+        "return_gating": True,
+        "use_patch": use_patch,
+    }
+    if user_ids is not None:
+        kwargs["user_ids"] = user_ids
     pos_logits, neg_logits, gating_weights = functional_call(
         model,
         params,
         args=(),
-        kwargs={
-            "input_ids": input_ids,
-            "pos_ids": pos_ids,
-            "neg_ids": neg_ids,
-            "patch_params": eta,
-            "return_gating": True,
-            "use_patch": use_patch,
-        },
+        kwargs=kwargs,
     )
     if return_gating:
         return pos_logits, neg_logits, gating_weights
@@ -902,6 +1118,148 @@ def build_kmeans_centers(
     return centers
 
 
+def build_user_patch_table(
+    dataset: "LooSequenceDataset",
+    model: "SASRec",
+    centers: torch.Tensor,
+    config: SASRecConfig,
+) -> torch.Tensor:
+    users = list(dataset.users)
+    weight = model.item_emb.weight.detach().cpu()
+    centers_cpu = centers.detach().cpu()
+    table = torch.zeros((dataset.num_users,), dtype=torch.long)
+    emb_list: List[torch.Tensor] = []
+    for user in users:
+        seq = dataset.user_seq.get(user, [])
+        if not seq:
+            emb_list.append(torch.zeros(config.hidden_units))
+            continue
+        if len(seq) > config.max_seq_length:
+            seq = seq[-config.max_seq_length :]
+        ids = torch.tensor([x for x in seq if x > 1], dtype=torch.long)
+        if ids.numel() == 0:
+            emb_list.append(torch.zeros(config.hidden_units))
+            continue
+        emb = weight.index_select(0, ids).mean(dim=0).float()
+        emb_list.append(emb)
+    if not emb_list:
+        return table
+    data = torch.stack(emb_list, dim=0)
+    dist = torch.cdist(data, centers_cpu)
+    idx = dist.argmin(dim=1).to(torch.long)
+    for i, user in enumerate(users):
+        if user < table.numel():
+            table[user] = idx[i]
+    return table
+
+
+class LooTrainDataset(Dataset):
+    """Training dataset for leave-two-out sequences."""
+
+    def __init__(self, dataset: LooSequenceDataset, config: SASRecConfig):
+        self.dataset = dataset
+        self.max_seq_length = config.max_seq_length
+        self.samples = []
+        for user in dataset.users:
+            seq = dataset.user_seq[user]
+            if len(seq) > 3:  # Need at least 4 items to keep enough training targets
+                self.samples.append((user, seq[:-2]))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        return self.samples[idx]
+
+
+def _resample_negatives(
+    neg_row: torch.Tensor,
+    seen_tensor: torch.Tensor,
+    min_item_id: int,
+    max_item: int,
+    valid_mask: Optional[torch.Tensor] = None,
+    max_tries: int = 10,
+) -> None:
+    if seen_tensor.numel() == 0:
+        return
+    mask = torch.isin(neg_row, seen_tensor)
+    if valid_mask is not None:
+        mask = mask & valid_mask
+    tries = 0
+    while mask.any() and tries < max_tries:
+        neg_row[mask] = torch.randint(
+            min_item_id,
+            max_item + 1,
+            size=(int(mask.sum().item()),),
+            dtype=neg_row.dtype,
+            device=neg_row.device,
+        )
+        mask = torch.isin(neg_row, seen_tensor)
+        if valid_mask is not None:
+            mask = mask & valid_mask
+        tries += 1
+
+
+def build_train_collate_fn(train_data: LooTrainDataset, config: SASRecConfig):
+    base_dataset = train_data.dataset
+    max_seq_length = config.max_seq_length
+    min_item_id = base_dataset.min_item_id
+    max_item = base_dataset.max_item
+    sample_id_stride = max(1, base_dataset.max_train_seq_len + 1)
+
+    def collate(batch):
+        batch_size = len(batch)
+        seq_tensors = torch.zeros((batch_size, max_seq_length), dtype=torch.long)
+        pos_tensors = torch.zeros((batch_size, max_seq_length), dtype=torch.long)
+        neg_tensors = torch.randint(
+            min_item_id,
+            max_item + 1,
+            size=(batch_size, max_seq_length),
+            dtype=torch.long,
+        )
+        sample_id_tensors = torch.zeros((batch_size, max_seq_length), dtype=torch.long)
+        user_id_tensors = torch.zeros((batch_size,), dtype=torch.long)
+        internal_user_id_tensors = torch.zeros((batch_size,), dtype=torch.long)
+
+        for i, (user, seq) in enumerate(batch):
+            internal_user_id_tensors[i] = user
+            user_id_tensors[i] = base_dataset.internal_to_user_id.get(user, user)
+            seq_len = min(len(seq), max_seq_length)
+            if seq_len < 1:
+                continue
+            if len(seq) > max_seq_length:
+                start_idx = len(seq) - max_seq_length
+                seq = seq[-max_seq_length:]
+                seq_len = max_seq_length
+            else:
+                start_idx = 0
+            seq_tensors[i, -seq_len:] = torch.as_tensor(seq[:seq_len], dtype=torch.long)
+            if seq_len > 1:
+                pos_tensors[i, -seq_len:-1] = torch.as_tensor(seq[1:seq_len], dtype=torch.long)
+            base_offset = user * sample_id_stride + start_idx
+            positions = torch.arange(seq_len, dtype=torch.long)
+            sample_id_tensors[i, -seq_len:] = base_offset + positions
+
+        valid_mask = pos_tensors != 0
+        for i, (user, _) in enumerate(batch):
+            seen = base_dataset.user_seq.get(user, [])
+            if not seen:
+                continue
+            seen_tensor = torch.as_tensor([x for x in seen if x > 1], dtype=torch.long)
+            _resample_negatives(neg_tensors[i], seen_tensor, min_item_id, max_item, valid_mask[i])
+
+        return {
+            "input_ids": seq_tensors,
+            "pos_ids": pos_tensors,
+            "neg_ids": neg_tensors,
+            "sample_ids": sample_id_tensors,
+            "user_ids": user_id_tensors,
+            "internal_user_ids": internal_user_id_tensors,
+        }
+
+    return collate
+
+
 class SequentialSampler:
     """
     Sampler for sequential data that generates training batches.
@@ -947,8 +1305,10 @@ class SequentialSampler:
             neg_tensors = torch.zeros((actual_batch_size, self.max_seq_length), dtype=torch.long)
             sample_id_tensors = torch.zeros((actual_batch_size, self.max_seq_length), dtype=torch.long)
             user_id_tensors = torch.zeros((actual_batch_size,), dtype=torch.long)
+            internal_user_id_tensors = torch.zeros((actual_batch_size,), dtype=torch.long)
 
             for idx, (user, seq) in enumerate(batch_data):
+                internal_user_id_tensors[idx] = user
                 user_id_tensors[idx] = self.dataset.internal_to_user_id.get(user, user)
                 # For each training step, we predict all positions in the sequence
                 seq_len = min(len(seq), self.max_seq_length)
@@ -989,6 +1349,7 @@ class SequentialSampler:
                 "neg_ids": neg_tensors,
                 "sample_ids": sample_id_tensors,
                 "user_ids": user_id_tensors,
+                "internal_user_ids": internal_user_id_tensors,
             }
 
     def __len__(self):
@@ -1039,7 +1400,7 @@ def evaluate(
             eta_requires_grad = model.meta_patch.eta.requires_grad
             model.meta_patch.eta.requires_grad_(False)
 
-    users = dataset.users
+    users = list(dataset.users)
 
     for batch_start in range(0, len(users), batch_size):
         batch_users = users[batch_start : batch_start + batch_size]
@@ -1086,12 +1447,29 @@ def evaluate(
         use_len = max_len
         if truncate_len is not None and truncate_len > 0:
             use_len = min(truncate_len, max_len)
-        input_tensor = torch.zeros((len(batch_users), max_len), dtype=torch.long)
-
-        for i, seq in enumerate(batch_seqs):
-            if seq and batch_valid_mask[i]:
-                seq_len = min(len(seq), use_len)
-                input_tensor[i, -seq_len:] = torch.tensor(seq[-seq_len:])
+        prefix_len = int(getattr(config, "prefix_len", 0) or 0)
+        if prefix_len > 0:
+            total_len = prefix_len + use_len
+            input_tensor = torch.zeros((len(batch_users), total_len), dtype=torch.long)
+            for i, seq in enumerate(batch_seqs):
+                if seq and batch_valid_mask[i]:
+                    full_len = min(len(seq), max_len)
+                    trimmed = seq[-full_len:]
+                    prefix_eff = min(prefix_len, full_len)
+                    tail_eff = min(use_len, max(0, full_len - prefix_eff))
+                    if prefix_eff > 0:
+                        prefix_tokens = torch.tensor(trimmed[:prefix_eff])
+                        input_tensor[i, :prefix_eff] = prefix_tokens
+                    if tail_eff > 0:
+                        tail_tokens = torch.tensor(trimmed[-tail_eff:])
+                        tail_start = total_len - tail_eff
+                        input_tensor[i, tail_start : tail_start + tail_eff] = tail_tokens
+        else:
+            input_tensor = torch.zeros((len(batch_users), max_len), dtype=torch.long)
+            for i, seq in enumerate(batch_seqs):
+                if seq and batch_valid_mask[i]:
+                    seq_len = min(len(seq), use_len)
+                    input_tensor[i, -seq_len:] = torch.tensor(seq[-seq_len:])
 
         input_tensor = input_tensor.to(device)
 
@@ -1101,12 +1479,13 @@ def evaluate(
 
         valid_input = input_tensor[valid_indices]
         valid_targets = [batch_targets[i] for i in valid_indices]
+        valid_user_ids = [batch_users[i] for i in valid_indices]
 
         if mode == "meta-test":
             _load_params_by_name(model, init_state, theta_names)
             if adapt_steps > 0:
                 adapt_input, adapt_pos, adapt_neg = _build_adapt_tensors(
-                    valid_input, dataset.max_item
+                    valid_input, dataset.max_item, prefix_len=int(getattr(config, "prefix_len", 0))
                 )
                 if meta_unk_prob > 0:
                     adapt_input = _mask_inputs_with_unk(adapt_input, meta_unk_prob)
@@ -1121,6 +1500,7 @@ def evaluate(
                         adapt_pos,
                         adapt_neg,
                         patch_params=None,
+                        user_ids=torch.as_tensor(valid_user_ids, device=device),
                         use_patch=use_patch,
                     )
                     pos_loss = F.binary_cross_entropy_with_logits(
@@ -1146,24 +1526,39 @@ def evaluate(
 
         with torch.no_grad():
             sample_size = max(2, config.eval_sample_size)
-            candidates_list = []
-            use_fixed_neg = hasattr(dataset, "neg_item_by_user")
-            for idx, user in enumerate([batch_users[i] for i in valid_indices]):
-                target = valid_targets[idx]
-                candidates = [target]
-                seen_items = {x for x in dataset.user_seq[user] if x > 1}
-                if use_fixed_neg:
-                    fixed_neg = dataset.neg_item_by_user.get(user)
-                    if fixed_neg and fixed_neg not in seen_items and fixed_neg != target and fixed_neg > 1:
-                        candidates.append(fixed_neg)
-                while len(candidates) < sample_size:
-                    neg_item = np.random.randint(2, dataset.max_item + 1)
-                    if neg_item not in seen_items and neg_item not in candidates:
-                        candidates.append(neg_item)
-                candidates_list.append(torch.tensor(candidates, device=device))
-            candidates_tensor = torch.stack(candidates_list, dim=0)
+            if mode == "val":
+                candidates_tensor = _build_eval_candidates_fast(
+                    dataset=dataset,
+                    users=valid_user_ids,
+                    targets=valid_targets,
+                    sample_size=sample_size,
+                    device=torch.device(device),
+                )
+            else:
+                candidates_list = []
+                use_fixed_neg = hasattr(dataset, "neg_item_by_user")
+                for idx, user in enumerate(valid_user_ids):
+                    target = valid_targets[idx]
+                    candidates = [target]
+                    seen_items = {x for x in dataset.user_seq[user] if x > 1}
+                    if use_fixed_neg:
+                        fixed_neg = dataset.neg_item_by_user.get(user)
+                        if fixed_neg and fixed_neg not in seen_items and fixed_neg != target and fixed_neg > 1:
+                            candidates.append(fixed_neg)
+                    while len(candidates) < sample_size:
+                        neg_item = np.random.randint(2, dataset.max_item + 1)
+                        if neg_item not in seen_items and neg_item not in candidates:
+                            candidates.append(neg_item)
+                    candidates_list.append(torch.tensor(candidates, device=device))
+                candidates_tensor = torch.stack(candidates_list, dim=0)
 
-            scores = model.predict(valid_input, candidates_tensor, use_patch=use_patch, use_head=use_head)
+            scores = model.predict(
+                valid_input,
+                candidates_tensor,
+                user_ids=torch.as_tensor(valid_user_ids, device=device),
+                use_patch=use_patch,
+                use_head=use_head,
+            )
 
         _, indices = torch.sort(scores, dim=1, descending=True)
         ranks = (indices == 0).nonzero(as_tuple=True)[1].cpu().numpy() + 1  # 1-indexed ranks
@@ -1203,6 +1598,57 @@ def _slice_batch_tail(batch: Dict[str, torch.Tensor], tail_len: int) -> Dict[str
     return out
 
 
+def _drop_prefix_from_batch(
+    batch: Dict[str, torch.Tensor],
+    prefix_len: int,
+    tail_len: int,
+    dataset: LooSequenceDataset,
+) -> Dict[str, torch.Tensor]:
+    """Remove prefix positions, keep tail length, and zero prefix losses."""
+    if prefix_len <= 0:
+        return _slice_batch_tail(batch, tail_len)
+    input_ids = batch["input_ids"]
+    device = input_ids.device
+    batch_size, full_len = input_ids.size()
+    tail_len = max(1, int(tail_len))
+    prefix_len = max(1, int(prefix_len))
+    out_len = tail_len
+
+    out_input = torch.zeros((batch_size, out_len), dtype=input_ids.dtype, device=device)
+    out_pos = torch.zeros((batch_size, out_len), dtype=input_ids.dtype, device=device)
+    seq_lens = (input_ids != 0).sum(dim=1)
+    for i in range(batch_size):
+        seq_len = int(seq_lens[i].item())
+        if seq_len <= 0:
+            continue
+        start = full_len - seq_len
+        prefix_eff = min(prefix_len, seq_len)
+        tail_eff = min(tail_len, max(0, seq_len - prefix_eff))
+        if tail_eff <= 0:
+            continue
+        tail_tokens = input_ids[i, full_len - tail_eff : full_len]
+        out_input[i, -tail_eff:] = tail_tokens
+        if tail_eff > 1:
+            out_pos[i, -tail_eff:-1] = tail_tokens[1:tail_eff]
+
+    user_ids = batch.get("internal_user_ids")
+    if user_ids is None:
+        raise KeyError("internal_user_ids missing from batch; needed for tail negatives.")
+    neg_ids = _build_outer_neg_ids(
+        dataset=dataset,
+        user_ids=user_ids,
+        pos_ids=out_pos,
+        num_neg=1,
+        device=device,
+    ).squeeze(-1)
+    return {
+        "input_ids": out_input,
+        "pos_ids": out_pos,
+        "neg_ids": neg_ids,
+        "internal_user_ids": user_ids,
+    }
+
+
 def _sample_negative_item(min_id: int, max_id_exclusive: int, seen_items: set) -> int:
     item_id = np.random.randint(min_id, max_id_exclusive)
     while item_id in seen_items:
@@ -1213,9 +1659,13 @@ def _sample_negative_item(min_id: int, max_id_exclusive: int, seen_items: set) -
 def _build_adapt_tensors(
     input_ids: torch.Tensor,
     max_item: int,
+    prefix_len: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     pos_ids = torch.zeros_like(input_ids)
     pos_ids[:, :-1] = input_ids[:, 1:]
+    if prefix_len and prefix_len > 0 and input_ids.size(1) >= prefix_len:
+        pos_ids[:, :prefix_len] = 0
+    pos_ids[input_ids == 0] = 0
     pos_ids[pos_ids <= 1] = 0
     neg_ids = torch.zeros_like(input_ids)
     input_cpu = input_ids.detach().cpu().numpy()
@@ -1227,7 +1677,212 @@ def _build_adapt_tensors(
             if input_cpu[i][j] == 0:
                 continue
             neg_ids[i, j] = _sample_negative_item(2, max_item + 1, seen)
+    if prefix_len and prefix_len > 0 and input_ids.size(1) >= prefix_len:
+        neg_ids[:, :prefix_len] = 0
     return input_ids, pos_ids, neg_ids
+
+
+def _build_prefix_tail_batch(
+    batch: Dict[str, torch.Tensor],
+    prefix_len: int,
+    tail_len: int,
+    dataset: LooSequenceDataset,
+) -> Dict[str, torch.Tensor]:
+    if prefix_len <= 0:
+        return _slice_batch_tail(batch, tail_len)
+    input_ids = batch["input_ids"]
+    device = input_ids.device
+    batch_size, full_len = input_ids.size()
+    tail_len = max(1, int(tail_len))
+    prefix_len = max(1, int(prefix_len))
+    out_len = prefix_len + tail_len
+
+    out_input = torch.zeros((batch_size, out_len), dtype=input_ids.dtype, device=device)
+    out_pos = torch.zeros((batch_size, out_len), dtype=input_ids.dtype, device=device)
+
+    seq_lens = (input_ids != 0).sum(dim=1)
+    for i in range(batch_size):
+        seq_len = int(seq_lens[i].item())
+        if seq_len <= 0:
+            continue
+        start = full_len - seq_len
+        prefix_eff = min(prefix_len, seq_len)
+        tail_eff = min(tail_len, max(0, seq_len - prefix_eff))
+
+        prefix_tokens = input_ids[i, start : start + prefix_eff]
+        if prefix_eff > 0:
+            out_input[i, :prefix_eff] = prefix_tokens
+            if prefix_eff > 1:
+                out_pos[i, : prefix_eff - 1] = prefix_tokens[1:prefix_eff]
+
+        if tail_eff > 0:
+            tail_tokens = input_ids[i, full_len - tail_eff : full_len]
+            tail_start = out_len - tail_eff
+            out_input[i, tail_start : tail_start + tail_eff] = tail_tokens
+            if tail_eff > 1:
+                out_pos[i, tail_start : tail_start + tail_eff - 1] = tail_tokens[1:tail_eff]
+
+    if prefix_len > 0:
+        out_pos[:, :prefix_len] = 0
+
+    user_ids = batch.get("internal_user_ids")
+    if user_ids is None:
+        raise KeyError("internal_user_ids missing from batch; needed for prefix+tail negatives.")
+    neg_ids = _build_outer_neg_ids(
+        dataset=dataset,
+        user_ids=user_ids,
+        pos_ids=out_pos,
+        num_neg=1,
+        device=device,
+    ).squeeze(-1)
+    if prefix_len > 0:
+        neg_ids[:, :prefix_len] = 0
+
+    return {
+        "input_ids": out_input,
+        "pos_ids": out_pos,
+        "neg_ids": neg_ids,
+        "internal_user_ids": user_ids,
+    }
+
+
+def _build_outer_neg_ids(
+    dataset: LooSequenceDataset,
+    user_ids: torch.Tensor,
+    pos_ids: torch.Tensor,
+    num_neg: int,
+    device: torch.device,
+    max_tries: int = 5,
+) -> torch.Tensor:
+    if num_neg <= 0:
+        raise ValueError("num_neg must be positive.")
+    batch_size, seq_len = pos_ids.shape
+    min_id = max(2, getattr(dataset, "min_item_id", 1))
+    max_item = dataset.max_item
+    neg = torch.randint(min_id, max_item + 1, size=(batch_size, seq_len, num_neg), device=device)
+    if batch_size == 0:
+        return neg
+    valid_mask = pos_ids != 0
+    user_ids_list = user_ids.detach().cpu().tolist()
+    for i, uid in enumerate(user_ids_list):
+        seen = dataset.user_seq.get(uid, [])
+        if not seen:
+            continue
+        seen_tensor = torch.as_tensor([x for x in seen if x > 1], device=device, dtype=torch.long)
+        row = neg[i].reshape(-1)
+        mask = valid_mask[i].unsqueeze(-1).expand(seq_len, num_neg).reshape(-1)
+        _resample_negatives(row, seen_tensor, min_id, max_item, mask, max_tries=max_tries)
+    return neg
+
+
+def _select_middle_positions(
+    input_ids: torch.Tensor,
+    prefix_len: int,
+    tail_len: int,
+    num_samples: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Select middle-segment indices (between prefix and tail) for each sequence."""
+    batch_size, seq_len = input_ids.shape
+    device = input_ids.device
+    mid_idx = torch.zeros((batch_size, num_samples), dtype=torch.long, device=device)
+    mid_mask = torch.zeros((batch_size, num_samples), dtype=torch.bool, device=device)
+    if num_samples <= 0:
+        return mid_idx, mid_mask
+    seq_lens = (input_ids != 0).sum(dim=1)
+    for i in range(batch_size):
+        length = int(seq_lens[i].item())
+        if length <= 0:
+            continue
+        prefix_eff = min(prefix_len, length)
+        tail_eff = min(tail_len, max(0, length - prefix_eff))
+        mid_len = length - prefix_eff - tail_eff
+        if mid_len <= 0:
+            continue
+        k = min(num_samples, mid_len)
+        start = seq_len - length
+        if k == 1:
+            offsets = torch.tensor([mid_len // 2], device=device)
+        else:
+            offsets = torch.linspace(0, mid_len - 1, steps=k, device=device).round().long()
+        idx = start + prefix_eff + offsets
+        mid_idx[i, :k] = idx
+        mid_mask[i, :k] = True
+    return mid_idx, mid_mask
+
+
+def _collect_head_params_from_params(
+    model: SASRec,
+    params: Dict[str, torch.Tensor],
+    config: SASRecConfig,
+) -> Optional[List[torch.Tensor]]:
+    if not getattr(config, "enable_projection_head", True):
+        return None
+    head_params: List[torch.Tensor] = []
+    for name, _ in model.proj_linear.named_parameters(prefix="proj_linear"):
+        head_params.append(params[name])
+    if getattr(config, "head_use_ln", True) and hasattr(model, "proj_ln"):
+        for name, _ in model.proj_ln.named_parameters(prefix="proj_ln"):
+            head_params.append(params[name])
+    return head_params
+
+
+def _build_eval_candidates_fast(
+    dataset: LooSequenceDataset,
+    users: List[int],
+    targets: List[int],
+    sample_size: int,
+    device: torch.device,
+    max_tries: int = 3,
+) -> torch.Tensor:
+    if sample_size < 2:
+        sample_size = 2
+    batch_size = len(users)
+    if batch_size == 0:
+        return torch.empty((0, sample_size), device=device, dtype=torch.long)
+    min_id = max(2, getattr(dataset, "min_item_id", 1))
+    max_item = dataset.max_item
+    neg_size = sample_size - 1
+    targets_t = torch.as_tensor(targets, device=device, dtype=torch.long)
+    if neg_size <= 0:
+        return targets_t.unsqueeze(1)
+
+    neg = torch.randint(min_id, max_item + 1, size=(batch_size, neg_size), device=device)
+
+    use_fixed_neg = hasattr(dataset, "neg_item_by_user")
+    seen_lists: List[List[int]] = []
+    fixed_vals = torch.zeros((batch_size,), device=device, dtype=torch.long)
+    fixed_mask = torch.zeros((batch_size,), device=device, dtype=torch.bool)
+    for i, user in enumerate(users):
+        seen = [x for x in dataset.user_seq[user] if x > 1]
+        seen_lists.append(seen)
+        if use_fixed_neg:
+            fixed_neg = dataset.neg_item_by_user.get(user)
+            if fixed_neg and fixed_neg > 1 and fixed_neg != targets[i] and fixed_neg not in seen:
+                fixed_vals[i] = fixed_neg
+                fixed_mask[i] = True
+
+    max_seen = max((len(s) for s in seen_lists), default=0)
+    if max_seen > 0:
+        seen_padded = torch.full((batch_size, max_seen), -1, device=device, dtype=torch.long)
+        for i, seen in enumerate(seen_lists):
+            if seen:
+                seen_padded[i, : len(seen)] = torch.as_tensor(seen, device=device, dtype=torch.long)
+        for _ in range(max_tries):
+            mask = torch.isin(neg, seen_padded) | (neg == targets_t.unsqueeze(1))
+            if not mask.any():
+                break
+            neg[mask] = torch.randint(min_id, max_item + 1, size=(int(mask.sum().item()),), device=device)
+    else:
+        for _ in range(max_tries):
+            mask = neg == targets_t.unsqueeze(1)
+            if not mask.any():
+                break
+            neg[mask] = torch.randint(min_id, max_item + 1, size=(int(mask.sum().item()),), device=device)
+
+    if use_fixed_neg and fixed_mask.any():
+        neg[fixed_mask, 0] = fixed_vals[fixed_mask]
+
+    return torch.cat([targets_t.unsqueeze(1), neg], dim=1)
 
 
 def _snapshot_params_by_name(
@@ -1298,6 +1953,7 @@ def train_sasrec_meta(
         raise RuntimeError("No parameters selected for inner loop; check BitFit selection.")
     theta = [base_params[n].detach().clone().requires_grad_(True) for n in theta_names]
     inner_opt = MomentumInner(theta, lr=config.inner_lr, momentum=config.inner_momentum)
+    theta_init = [t.detach().clone() for t in theta]
     logger.info(
         "BitFit inner params: %s tensors, %s parameters",
         len(theta_names),
@@ -1313,6 +1969,7 @@ def train_sasrec_meta(
         input_ids: torch.Tensor,
         pos_ids: torch.Tensor,
         neg_ids: torch.Tensor,
+        user_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         pos_logits, neg_logits, _ = sasrec_training_step_stateless(
             model,
@@ -1324,6 +1981,7 @@ def train_sasrec_meta(
             input_ids,
             pos_ids,
             neg_ids,
+            user_ids,
             use_patch=True,
         )
         pos_loss = bce_criterion(pos_logits, torch.ones_like(pos_logits))
@@ -1347,8 +2005,9 @@ def train_sasrec_meta(
         input_ids: torch.Tensor,
         pos_ids: torch.Tensor,
         neg_ids: torch.Tensor,
+        user_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return config.lambda_meta * _inner_loss(theta_list, eta_tensor, input_ids, pos_ids, neg_ids)
+        return config.lambda_meta * _inner_loss(theta_list, eta_tensor, input_ids, pos_ids, neg_ids, user_ids)
 
     def _outer_loss(
         theta_list: List[torch.Tensor],
@@ -1359,7 +2018,24 @@ def train_sasrec_meta(
         long_input_ids: torch.Tensor,
         long_pos_ids: torch.Tensor,
         long_neg_ids: torch.Tensor,
+        user_ids: torch.Tensor,
     ) -> torch.Tensor:
+        nonlocal last_outer_mid_loss
+        nonlocal last_outer_tail_loss
+        num_neg = max(1, int(getattr(config, "outer_neg_samples", 1)))
+        if num_neg > 1:
+            neg_long_ids = _build_outer_neg_ids(
+                dataset=train_dataset,
+                user_ids=user_ids,
+                pos_ids=long_pos_ids,
+                num_neg=num_neg,
+                device=long_pos_ids.device,
+            )
+            neg_short_ids = neg_long_ids[:, -short_pos_ids.size(1) :, :]
+        else:
+            neg_short_ids = short_neg_ids
+            neg_long_ids = long_neg_ids
+
         pos_short, neg_short, _ = sasrec_training_step_stateless(
             model,
             base_params,
@@ -1369,10 +2045,11 @@ def train_sasrec_meta(
             eta_tensor,
             short_input_ids,
             short_pos_ids,
-            short_neg_ids,
+            neg_short_ids,
+            user_ids,
             use_patch=True,
         )
-        pos_long, neg_long, _ = sasrec_training_step_stateless(
+        pos_long_full, neg_long_full, _ = sasrec_training_step_stateless(
             model,
             base_params,
             base_buffers,
@@ -1381,18 +2058,137 @@ def train_sasrec_meta(
             eta_tensor,
             long_input_ids,
             long_pos_ids,
-            long_neg_ids,
+            neg_long_ids,
+            user_ids,
             use_patch=False,
         )
-        if pos_long.size(1) != pos_short.size(1):
-            pos_long = pos_long[:, -pos_short.size(1) :]
-            neg_long = neg_long[:, -pos_short.size(1) :]
-        pos_long = pos_long.detach()
-        neg_long = neg_long.detach()
-        raw_loss = (pos_short - pos_long).pow(2) + (neg_short - neg_long).pow(2)
+
+        pos_long_tail = pos_long_full
+        neg_long_tail = neg_long_full
+        if pos_long_tail.size(1) != pos_short.size(1):
+            pos_long_tail = pos_long_tail[:, -pos_short.size(1) :]
+            neg_long_tail = neg_long_tail[:, -pos_short.size(1) :]
+        pos_long_tail = pos_long_tail.detach()
+        neg_long_tail = neg_long_tail.detach()
+
+        distill = getattr(config, "outer_distill", "kl")
+        temp = float(getattr(config, "outer_distill_temperature", 1.0))
+        if temp <= 0:
+            temp = 1.0
+
+        def _distill_logits(
+            pos_student: torch.Tensor,
+            neg_student: torch.Tensor,
+            pos_teacher: torch.Tensor,
+            neg_teacher: torch.Tensor,
+        ) -> torch.Tensor:
+            if distill == "mse":
+                if neg_student.dim() == 3:
+                    neg_term = (neg_student - neg_teacher).pow(2).mean(dim=-1)
+                else:
+                    neg_term = (neg_student - neg_teacher).pow(2)
+                return (pos_student - pos_teacher).pow(2) + neg_term
+            if distill == "soft_bce":
+                pos_targets = torch.sigmoid(pos_teacher / temp)
+                neg_targets = torch.sigmoid(neg_teacher / temp)
+                pos_loss = F.binary_cross_entropy_with_logits(pos_student / temp, pos_targets, reduction="none")
+                neg_loss = F.binary_cross_entropy_with_logits(neg_student / temp, neg_targets, reduction="none")
+                if neg_loss.dim() == 3:
+                    neg_loss = neg_loss.mean(dim=-1)
+                return (pos_loss + neg_loss) * (temp ** 2)
+            if distill == "kl":
+                if neg_student.dim() == 3:
+                    logits_student = torch.cat([pos_student.unsqueeze(-1), neg_student], dim=-1)
+                    logits_teacher = torch.cat([pos_teacher.unsqueeze(-1), neg_teacher], dim=-1)
+                else:
+                    logits_student = torch.stack([pos_student, neg_student], dim=-1)
+                    logits_teacher = torch.stack([pos_teacher, neg_teacher], dim=-1)
+                logp_student = F.log_softmax(logits_student / temp, dim=-1)
+                logp_teacher = F.log_softmax(logits_teacher / temp, dim=-1)
+                p_teacher = logp_teacher.exp()
+                return (p_teacher * (logp_teacher - logp_student)).sum(dim=-1) * (temp ** 2)
+            raise ValueError(f"Unknown outer_distill: {distill}")
+
+        raw_loss = _distill_logits(pos_short, neg_short, pos_long_tail, neg_long_tail)
         valid_mask = short_pos_ids != 0
         mode = getattr(config, "outer_loss_mode", "all")
-        return _reduce_loss(raw_loss, valid_mask, mode, config.outer_loss_decay)
+        tail_loss = _reduce_loss(raw_loss, valid_mask, mode, config.outer_loss_decay)
+        last_outer_tail_loss = tail_loss.item() if isinstance(tail_loss, torch.Tensor) else float(tail_loss)
+        tail_weight = float(getattr(config, "outer_tail_weight", 1.0))
+        if tail_weight < 0:
+            tail_weight = 0.0
+        loss = tail_weight * tail_loss
+
+        last_outer_mid_loss = None
+        mid_weight = float(getattr(config, "outer_mid_weight", 0.0))
+        if mid_weight > 0 and config.patch_len > 0:
+            mid_samples = int(getattr(config, "outer_mid_samples", 0))
+            if mid_samples <= 0:
+                mid_samples = int(config.patch_len)
+            mid_samples = min(mid_samples, int(config.patch_len))
+            if mid_samples > 0:
+                mid_idx, mid_mask = _select_middle_positions(
+                    long_input_ids,
+                    int(getattr(config, "prefix_len", 0) or 0),
+                    int(getattr(config, "inner_seq_length", 0) or 0),
+                    mid_samples,
+                )
+                if mid_mask.any():
+                    mid_pos_ids = long_pos_ids.gather(1, mid_idx)
+                    if neg_long_ids.dim() == 3:
+                        idx_exp = mid_idx.unsqueeze(-1).expand(-1, -1, neg_long_ids.size(-1))
+                        mid_neg_ids = neg_long_ids.gather(1, idx_exp)
+                    else:
+                        mid_neg_ids = neg_long_ids.gather(1, mid_idx)
+
+                    mid_pos_ids = mid_pos_ids.masked_fill(~mid_mask, 0)
+                    if mid_neg_ids.dim() == 3:
+                        mid_neg_ids = mid_neg_ids.masked_fill(~mid_mask.unsqueeze(-1), 0)
+                    else:
+                        mid_neg_ids = mid_neg_ids.masked_fill(~mid_mask, 0)
+
+                    mid_teacher_pos = pos_long_full.gather(1, mid_idx).detach()
+                    if neg_long_full.dim() == 3:
+                        mid_teacher_neg = neg_long_full.gather(1, idx_exp).detach()
+                    else:
+                        mid_teacher_neg = neg_long_full.gather(1, mid_idx).detach()
+
+                    override = build_override(theta_names, theta_list)
+                    params = {**base_params, **override, **base_buffers}
+                    hidden_states = functional_call(
+                        model,
+                        params,
+                        args=(),
+                        kwargs={
+                            "input_ids": short_input_ids,
+                            "patch_params": eta_tensor,
+                            "user_ids": user_ids,
+                            "return_gating": False,
+                            "use_patch": True,
+                        },
+                    )
+                    patch_hidden = hidden_states[:, :mid_samples, :]
+                    head_params = _collect_head_params_from_params(model, params, config)
+                    patch_proj = model.apply_head(patch_hidden, head_params=head_params)
+
+                    item_weight = params.get("item_emb.weight", model.item_emb.weight)
+                    pos_emb = F.embedding(mid_pos_ids, item_weight)
+                    pos_mid = (patch_proj * pos_emb).sum(dim=-1)
+                    if mid_neg_ids.dim() == 3:
+                        neg_emb = F.embedding(mid_neg_ids, item_weight)
+                        neg_mid = (patch_proj.unsqueeze(2) * neg_emb).sum(dim=-1)
+                    else:
+                        neg_emb = F.embedding(mid_neg_ids, item_weight)
+                        neg_mid = (patch_proj * neg_emb).sum(dim=-1)
+
+                    mid_raw = _distill_logits(pos_mid, neg_mid, mid_teacher_pos, mid_teacher_neg)
+                    mid_valid = mid_mask & (mid_pos_ids != 0)
+                    if mid_valid.any():
+                        mid_loss = mid_raw[mid_valid].mean()
+                        loss = loss + mid_weight * mid_loss
+                        last_outer_mid_loss = mid_loss.item()
+
+        return loss
 
     grad_fn = get_fwdrev_grad_fn_eta(_inner_loss)
     grad_fn_meta = get_fwdrev_grad_fn_eta(_inner_loss_meta)
@@ -1401,12 +2197,25 @@ def train_sasrec_meta(
 
     train_cfg = replace(config, max_seq_length=config.max_seq_length, batch_size=config.batch_size)
     outer_cfg = replace(config, max_seq_length=config.max_seq_length, batch_size=config.val_batch_size)
-    train_sampler = SequentialSampler(train_dataset, train_cfg)
-    outer_sampler = SequentialSampler(train_dataset, outer_cfg)
-    outer_iter = iter(outer_sampler)
-    extra_iter = iter(train_sampler)
+    train_data = LooTrainDataset(train_dataset, train_cfg)
+    collate_fn = build_train_collate_fn(train_data, train_cfg)
+    num_workers = max(0, int(config.num_workers))
+    loader_kwargs = {
+        "batch_size": train_cfg.batch_size,
+        "shuffle": True,
+        "num_workers": num_workers,
+        "pin_memory": bool(config.pin_memory),
+        "collate_fn": collate_fn,
+        "drop_last": False,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = int(config.prefetch_factor)
+        loader_kwargs["persistent_workers"] = bool(config.persistent_workers)
+    train_loader = DataLoader(train_data, **loader_kwargs)
+    outer_loader = DataLoader(train_data, **{**loader_kwargs, "batch_size": outer_cfg.batch_size})
+    outer_iter = iter(outer_loader)
 
-    steps_per_epoch = len(train_sampler)
+    steps_per_epoch = len(train_loader)
     total_steps = config.num_epochs * steps_per_epoch
     pbar = tqdm(total=total_steps)
 
@@ -1414,6 +2223,8 @@ def train_sasrec_meta(
 
     global_step = 0
     last_outer_loss = None
+    last_outer_tail_loss = None
+    last_outer_mid_loss = None
     best_val_metrics = {"ndcg@10": 0.0, "hr@10": 0.0}
     best_ckpt_path: Optional[Path] = None
     timing_enabled = bool(getattr(config, "enable_timing", False))
@@ -1430,19 +2241,32 @@ def train_sasrec_meta(
     }
     timing_steps = 0
 
+    def _reset_inner_state() -> None:
+        for i in range(len(theta)):
+            theta[i] = theta_init[i].detach().clone().requires_grad_(True)
+        inner_opt.params = theta
+        inner_opt.m = [torch.zeros_like(p) for p in theta]
+        if recent_steps is not None:
+            recent_steps.clear()
+
     for epoch in range(config.num_epochs):
         model.train()
 
-        train_iter = iter(train_sampler)
+        train_iter = iter(train_loader)
+        extra_iter = iter(train_loader)
         for _ in range(steps_per_epoch):
             global_step += 1
+            if config.inner_reset_every and config.inner_reset_every > 0:
+                if global_step % int(config.inner_reset_every) == 0:
+                    _reset_inner_state()
+                    logger.info("Reset inner parameters at global step %s", global_step)
             if timing_enabled:
                 t_step_start = time.perf_counter()
                 t_fetch_start = time.perf_counter()
             try:
                 batch = next(train_iter)
             except StopIteration:
-                train_iter = iter(train_sampler)
+                train_iter = iter(train_loader)
                 batch = next(train_iter)
             fetch_ms = (time.perf_counter() - t_fetch_start) * 1000.0 if timing_enabled else 0.0
             if timing_enabled:
@@ -1458,7 +2282,7 @@ def train_sasrec_meta(
                 try:
                     extra_batch = next(extra_iter)
                 except StopIteration:
-                    extra_iter = iter(train_sampler)
+                    extra_iter = iter(train_loader)
                     extra_batch = next(extra_iter)
                 if timing_enabled:
                     extra_fetch_ms += (time.perf_counter() - t_extra_fetch) * 1000.0
@@ -1470,7 +2294,23 @@ def train_sasrec_meta(
             if timing_enabled:
                 t_inner_start = time.perf_counter()
             for step_batch in step_batches:
-                short_batch = _slice_batch_tail(step_batch, config.inner_seq_length)
+                if config.prefix_len and config.prefix_len > 0:
+                    if config.inner_drop_prefix:
+                        short_batch = _drop_prefix_from_batch(
+                            step_batch,
+                            config.prefix_len,
+                            config.inner_seq_length,
+                            train_dataset,
+                        )
+                    else:
+                        short_batch = _build_prefix_tail_batch(
+                            step_batch,
+                            config.prefix_len,
+                            config.inner_seq_length,
+                            train_dataset,
+                        )
+                else:
+                    short_batch = _slice_batch_tail(step_batch, config.inner_seq_length)
                 if (not config.drop_unseen_items) and config.inner_unk_mask_prob > 0:
                     short_batch = {
                         **short_batch,
@@ -1488,6 +2328,7 @@ def train_sasrec_meta(
                                 "input_ids": short_batch["input_ids"],
                                 "pos_ids": short_batch["pos_ids"],
                                 "neg_ids": short_batch["neg_ids"],
+                                "internal_user_ids": short_batch.get("internal_user_ids"),
                             },
                         )
                     )
@@ -1498,6 +2339,7 @@ def train_sasrec_meta(
                     short_batch["input_ids"],
                     short_batch["pos_ids"],
                     short_batch["neg_ids"],
+                    short_batch.get("internal_user_ids"),
                 )
                 if config.inner_grad_clip and config.inner_grad_clip > 0:
                     gflat = torch.clamp(gflat, min=-config.inner_grad_clip, max=config.inner_grad_clip)
@@ -1515,10 +2357,26 @@ def train_sasrec_meta(
                 try:
                     batch_long = next(outer_iter)
                 except StopIteration:
-                    outer_iter = iter(outer_sampler)
+                    outer_iter = iter(outer_loader)
                     batch_long = next(outer_iter)
                 batch_long = _move_batch_to_device(batch_long, device_obj)
-                batch_short = _slice_batch_tail(batch_long, config.inner_seq_length)
+                if config.prefix_len and config.prefix_len > 0:
+                    if config.inner_drop_prefix:
+                        batch_short = _drop_prefix_from_batch(
+                            batch_long,
+                            config.prefix_len,
+                            config.inner_seq_length,
+                            train_dataset,
+                        )
+                    else:
+                        batch_short = _build_prefix_tail_batch(
+                            batch_long,
+                            config.prefix_len,
+                            config.inner_seq_length,
+                            train_dataset,
+                        )
+                else:
+                    batch_short = _slice_batch_tail(batch_long, config.inner_seq_length)
 
                 latest_w, latest_m = inner_opt.snapshot()
                 if recent_steps is not None and config.meta_truncate_steps > 0:
@@ -1531,6 +2389,7 @@ def train_sasrec_meta(
                             step_batch["input_ids"],
                             step_batch["pos_ids"],
                             step_batch["neg_ids"],
+                            step_batch.get("internal_user_ids"),
                         )
                         if config.inner_grad_clip and config.inner_grad_clip > 0:
                             gflat = torch.clamp(gflat, min=-config.inner_grad_clip, max=config.inner_grad_clip)
@@ -1547,6 +2406,7 @@ def train_sasrec_meta(
                     batch_long["input_ids"],
                     batch_long["pos_ids"],
                     batch_long["neg_ids"],
+                    batch_long["internal_user_ids"],
                 )
                 model.train()
                 loss_outer.backward()
@@ -1562,7 +2422,23 @@ def train_sasrec_meta(
             if global_step == 1 or global_step % config.steps_per_train_log == 0:
                 if timing_enabled:
                     t_log_start = time.perf_counter()
-                log_batch = _slice_batch_tail(step_batches[-1], config.inner_seq_length)
+                if config.prefix_len and config.prefix_len > 0:
+                    if config.inner_drop_prefix:
+                        log_batch = _drop_prefix_from_batch(
+                            step_batches[-1],
+                            config.prefix_len,
+                            config.inner_seq_length,
+                            train_dataset,
+                        )
+                    else:
+                        log_batch = _build_prefix_tail_batch(
+                            step_batches[-1],
+                            config.prefix_len,
+                            config.inner_seq_length,
+                            train_dataset,
+                        )
+                else:
+                    log_batch = _slice_batch_tail(step_batches[-1], config.inner_seq_length)
                 avg_weights_list = None
                 with torch.no_grad():
                     pos_logits, neg_logits, gating = sasrec_training_step_stateless(
@@ -1575,6 +2451,7 @@ def train_sasrec_meta(
                         log_batch["input_ids"],
                         log_batch["pos_ids"],
                         log_batch["neg_ids"],
+                        log_batch.get("internal_user_ids"),
                         return_gating=True,
                         use_patch=True,
                     )
@@ -1632,13 +2509,16 @@ def train_sasrec_meta(
                         last_outer_loss,
                         gating_summary,
                     )
-                    log_metrics(
-                        {
-                            "meta/outer_loss": last_outer_loss,
-                            "progress/epoch": epoch + 1,
-                            "progress/step": global_step,
-                        }
-                    )
+                    outer_log = {
+                        "meta/outer_loss": last_outer_loss,
+                        "progress/epoch": epoch + 1,
+                        "progress/step": global_step,
+                    }
+                    if last_outer_tail_loss is not None:
+                        outer_log["meta/outer_tail_loss"] = last_outer_tail_loss
+                    if last_outer_mid_loss is not None:
+                        outer_log["meta/outer_mid_loss"] = last_outer_mid_loss
+                    log_metrics(outer_log)
                 if timing_enabled:
                     log_ms = (time.perf_counter() - t_log_start) * 1000.0
 
@@ -1723,11 +2603,7 @@ def train_sasrec_meta(
             if val_metrics["ndcg@10"] > best_val_metrics["ndcg@10"]:
                 best_val_metrics = val_metrics
                 if config.save_best_model:
-                    best_ckpt_path = save_model_checkpoint(
-                        model,
-                        config,
-                        filename="best_meta_patch.pt",
-                    )
+                    best_ckpt_path = save_model_checkpoint(model, config)
                     logger.info("Saved best val checkpoint to %s", best_ckpt_path)
 
     pbar.close()
@@ -1739,7 +2615,7 @@ def train_sasrec_meta(
             if name in param_dict:
                 param_dict[name].copy_(t.detach())
 
-    if val_dataset is not None:
+    if val_dataset is not None and config.eval_after_train:
         logger.info("Running validation evaluation after meta-training...")
         metrics = evaluate(
             model,
@@ -1755,11 +2631,7 @@ def train_sasrec_meta(
         if metrics["ndcg@10"] > best_val_metrics["ndcg@10"]:
             best_val_metrics = metrics
             if config.save_best_model:
-                best_ckpt_path = save_model_checkpoint(
-                    model,
-                    config,
-                    filename="best_meta_patch.pt",
-                )
+                best_ckpt_path = save_model_checkpoint(model, config)
                 logger.info("Saved best val checkpoint to %s", best_ckpt_path)
     else:
         best_val_metrics = {"ndcg@10": 0.0, "hr@10": 0.0}
@@ -1771,7 +2643,7 @@ def save_item_embeddings(model: nn.Module, dataset, config: SASRecConfig) -> Pat
     """Save item embedding matrix (excluding padding idx=0)."""
     emb = model.item_emb.weight.detach().cpu().numpy()
     emb = emb[2:]  # drop padding and UNK rows
-    filename = f"item_embeddings_dim{config.hidden_units}_seq{config.max_seq_length}.npy"
+    filename = f"{build_checkpoint_tag(config)}_item_embeddings_best.npy"
     out_path = config.checkpoint_dir / filename
     np.save(out_path, emb)
     logger.info(f"Saved item embeddings to {out_path}")
@@ -1779,12 +2651,26 @@ def save_item_embeddings(model: nn.Module, dataset, config: SASRecConfig) -> Pat
     return out_path
 
 
-def save_model_checkpoint(model: nn.Module, config: SASRecConfig, filename: str) -> Path:
+def save_model_checkpoint(model: nn.Module, config: SASRecConfig, filename: Optional[str] = None) -> Path:
+    if filename is None:
+        filename = f"{build_checkpoint_tag(config)}_best.pt"
     out_path = config.checkpoint_dir / filename
+    mode = str(getattr(config, "checkpoint_mode", "full")).lower()
+    if mode not in {"full", "delta"}:
+        raise ValueError(f"Unknown checkpoint_mode: {mode}")
     payload = {
-        "state_dict": model.state_dict(),
-        "config": config.__dict__,
+        "checkpoint_mode": mode,
+        "config": _serialize_config(config),
     }
+    if mode == "full":
+        payload["state_dict"] = model.state_dict()
+    else:
+        delta_state, trainable_keys = _collect_trainable_state_dict(model)
+        payload["state_dict"] = delta_state
+        payload["trainable_keys"] = trainable_keys
+        payload["base_ckpt_path"] = (
+            str(config.pretrained_ckpt_path) if config.pretrained_ckpt_path else None
+        )
     torch.save(payload, out_path)
     return out_path
 
@@ -1832,22 +2718,40 @@ if __name__ == "__main__":
     if run is not None:
         run.config.update(config.__dict__, allow_val_change=True)
 
+    if str(getattr(config, "checkpoint_mode", "full")).lower() == "delta":
+        if not (config.pretrained_ckpt_path and Path(config.pretrained_ckpt_path).exists()):
+            raise FileNotFoundError(
+                f"checkpoint_mode=delta requires a valid pretrained_ckpt_path, but got: {config.pretrained_ckpt_path}"
+            )
+
     device_manager = DeviceManager(logger, preferred_device=config.device, gpu_id=None)
     device = device_manager.device
 
-    run_name = (
-        f"{config.backbone}-meta-patch-{config.dataset}-L{config.num_blocks}-H{config.hidden_units}"
-        f"-P{config.num_patches}x{config.patch_len}"
-        f"-short{config.inner_seq_length}-long{config.max_seq_length}"
-    )
+    run_name = _build_run_name(config)
     if run is not None:
         run.name = run_name
-    LOCAL_METRICS_LOGGER = LocalMetricsLogger(log_dir="logs", run_name=(run.name if run is not None else run_name))
+
+    base_ckpt_dir = Path(config.checkpoint_dir)
+    if base_ckpt_dir.name != "gating_patch_long_short":
+        base_ckpt_dir = base_ckpt_dir / "gating_patch_long_short"
+    config.run_tag = _build_run_tag(config, run)
+    config.checkpoint_dir = base_ckpt_dir / str(config.run_tag)
+    if run is not None:
+        run.config.update(
+            {"checkpoint_dir": str(config.checkpoint_dir), "run_tag": config.run_tag},
+            allow_val_change=True,
+        )
+
+    LOCAL_METRICS_LOGGER = LocalMetricsLogger(
+        log_dir=str(config.checkpoint_dir / "logs"),
+        run_name=(run.name if run is not None else run_name),
+    )
     config.log_config()
     if LOCAL_METRICS_LOGGER is not None and LOCAL_METRICS_LOGGER.jsonl_path is not None:
         logger.info("Local metrics JSONL: %s", LOCAL_METRICS_LOGGER.jsonl_path)
 
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    save_run_config(config, run_name, sys.argv)
 
     train_dataset = LooSequenceDataset(config.data_txt_path, config, logger=logger)
     meta_valid_dataset = train_dataset
@@ -1862,10 +2766,14 @@ if __name__ == "__main__":
         else:
             load_pretrained_backbone(model, config.pretrained_ckpt_path, state_dict=inferred_state)
     model = model.to(device)
-    if config.patch_routing == "kmeans":
+    if config.patch_routing in {"kmeans", "user_table"}:
         centers = build_kmeans_centers(train_dataset, model, config)
         model.meta_patch.set_kmeans_centers(centers)
         logger.info("KMeans routing centers set: %s patches.", centers.size(0))
+        if config.patch_routing == "user_table":
+            user_to_patch = build_user_patch_table(train_dataset, model, centers, config)
+            model.meta_patch.set_user_table(user_to_patch)
+            logger.info("User routing table set for %s users.", len(user_to_patch))
     initialize_head_as_identity(model)
     apply_bitfit_freeze(
         model,
@@ -1883,61 +2791,62 @@ if __name__ == "__main__":
     logger.info(f"Total parameters: {total_params:,}")
     logger.info(f"Trainable parameters: {trainable_params:,}")
 
-    logger.info("Running pre-train baseline on val (short seq, no patch)...")
-    val_baseline = evaluate(
-        model,
-        meta_valid_dataset,
-        config=config,
-        mode="val",
-        device=device,
-        use_patch=False,
-        use_head=True,
-        max_seq_length=config.max_seq_length,
-        truncate_len=config.eval_seq_length,
-        theta_names=theta_names,
-        bitfit_init_state=bitfit_init_state,
-    )
-    logger.info(
-        "Val Baseline - NDCG@10: %.4f, HR@10: %.4f",
-        val_baseline["ndcg@10"],
-        val_baseline["hr@10"],
-    )
-    log_metrics(
-        {
-            "val/baseline_ndcg@10": val_baseline["ndcg@10"],
-            "val/baseline_hr@10": val_baseline["hr@10"],
-            "progress/epoch": 0,
-            "progress/step": 0,
-        }
-    )
+    if config.eval_before_train:
+        logger.info("Running pre-train baseline on val (short seq, no patch)...")
+        val_baseline = evaluate(
+            model,
+            meta_valid_dataset,
+            config=config,
+            mode="val",
+            device=device,
+            use_patch=False,
+            use_head=True,
+            max_seq_length=config.max_seq_length,
+            truncate_len=config.eval_seq_length,
+            theta_names=theta_names,
+            bitfit_init_state=bitfit_init_state,
+        )
+        logger.info(
+            "Val Baseline - NDCG@10: %.4f, HR@10: %.4f",
+            val_baseline["ndcg@10"],
+            val_baseline["hr@10"],
+        )
+        log_metrics(
+            {
+                "val/baseline_ndcg@10": val_baseline["ndcg@10"],
+                "val/baseline_hr@10": val_baseline["hr@10"],
+                "progress/epoch": 0,
+                "progress/step": 0,
+            }
+        )
 
-    logger.info("Running pre-train meta-patch on val (patch + head)...")
-    val_meta_patch = evaluate(
-        model,
-        meta_valid_dataset,
-        config=config,
-        mode="val",
-        device=device,
-        use_patch=True,
-        use_head=True,
-        max_seq_length=config.max_seq_length,
-        truncate_len=config.eval_seq_length,
-        theta_names=theta_names,
-        bitfit_init_state=bitfit_init_state,
-    )
-    logger.info(
-        "Val Meta-Patch (pre-train) - NDCG@10: %.4f, HR@10: %.4f",
-        val_meta_patch["ndcg@10"],
-        val_meta_patch["hr@10"],
-    )
-    log_metrics(
-        {
-            "val/pre_meta_patch_ndcg@10": val_meta_patch["ndcg@10"],
-            "val/pre_meta_patch_hr@10": val_meta_patch["hr@10"],
-            "progress/epoch": 0,
-            "progress/step": 0,
-        }
-    )
+        logger.info("Running pre-train meta-patch on val (patch + head)...")
+        val_meta_patch = evaluate(
+            model,
+            meta_valid_dataset,
+            config=config,
+            mode="val",
+            device=device,
+            use_patch=True,
+            use_head=True,
+            max_seq_length=config.max_seq_length,
+            truncate_len=config.eval_seq_length,
+            theta_names=theta_names,
+            bitfit_init_state=bitfit_init_state,
+        )
+        logger.info(
+            "Val Meta-Patch (pre-train) - NDCG@10: %.4f, HR@10: %.4f",
+            val_meta_patch["ndcg@10"],
+            val_meta_patch["hr@10"],
+        )
+        log_metrics(
+            {
+                "val/pre_meta_patch_ndcg@10": val_meta_patch["ndcg@10"],
+                "val/pre_meta_patch_hr@10": val_meta_patch["hr@10"],
+                "progress/epoch": 0,
+                "progress/step": 0,
+            }
+        )
 
     best_metrics, best_ckpt_path = train_sasrec_meta(
         model=model,
@@ -1951,7 +2860,18 @@ if __name__ == "__main__":
         logger.info("Loading best val checkpoint for test: %s", best_ckpt_path)
         best_ckpt = load_checkpoint(str(best_ckpt_path), trust_pickle=True)
         best_state = _strip_module_prefix(_extract_state_dict(best_ckpt))
-        model.load_state_dict(best_state, strict=True)
+        ckpt_mode = str(best_ckpt.get("checkpoint_mode", "full")).lower() if isinstance(best_ckpt, dict) else "full"
+        if ckpt_mode == "delta":
+            base_path = best_ckpt.get("base_ckpt_path") if isinstance(best_ckpt, dict) else None
+            if base_path and config.pretrained_ckpt_path and str(base_path) != str(config.pretrained_ckpt_path):
+                logger.warning(
+                    "Delta checkpoint base_ckpt_path (%s) differs from current pretrained_ckpt_path (%s).",
+                    base_path,
+                    config.pretrained_ckpt_path,
+                )
+            model.load_state_dict(best_state, strict=False)
+        else:
+            model.load_state_dict(best_state, strict=True)
 
     logger.info("Running final test evaluation (baseline: short seq, no patch, meta-test)...")
     baseline_metrics = evaluate(
@@ -2008,14 +2928,34 @@ if __name__ == "__main__":
         }
     )
 
-    if config.save_item_embeddings:
-        save_item_embeddings(model, train_dataset, config)
+    if run is not None and best_ckpt_path is not None and Path(best_ckpt_path).exists():
+        run.save(str(best_ckpt_path))
 
+    if config.save_item_embeddings:
+        emb_path = save_item_embeddings(model, train_dataset, config)
+        if run is not None and emb_path is not None:
+            run.save(str(emb_path))
+
+    metrics_jsonl = None
+    metrics_csv = None
     if LOCAL_METRICS_LOGGER is not None:
+        metrics_jsonl = LOCAL_METRICS_LOGGER.jsonl_path
         csv_path = LOCAL_METRICS_LOGGER.export_csv()
         if csv_path is not None:
+            metrics_csv = csv_path
             logger.info("Local metrics CSV: %s", csv_path)
         LOCAL_METRICS_LOGGER.close()
+
+    save_run_summary(
+        config,
+        run_name,
+        best_metrics,
+        baseline_metrics,
+        meta_metrics,
+        best_ckpt_path,
+        metrics_jsonl=metrics_jsonl,
+        metrics_csv=metrics_csv,
+    )
 
     wandb.finish()
     logger.info("Training complete!")

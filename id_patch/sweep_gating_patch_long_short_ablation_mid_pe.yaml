@@ -1,0 +1,40 @@
+program: /home/lingfengs111/codes/soft_patch_training/id_patch/train_gating_patch_long_short.py
+project: gating_patch_long_short-taobao_loo202
+method: grid
+metric:
+  name: val/meta_patch_ndcg@10
+  goal: maximize
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+parameters:
+  device:
+    value: "cuda:0"
+  seed:
+    value: 2026
+  patch_routing:
+    value: "user_table"
+  prefix_len:
+    values: [5, 10]
+  prefix_tail_positions:
+    values: [true, false]
+  outer_mid_weight:
+    value: 1.0
+  outer_mid_samples:
+    value: 0
+  outer_tail_weight:
+    values: [0.0, 1.0]
+  eval_after_train:
+    value: false
+  eval_sample_size:
+    value: 1000
+  val_eval_every_epochs:
+    value: 4
+  batch_size:
+    value: 1024
+  inner_seq_length:
+    value: 50
+  eval_seq_length:
+    value: 50
