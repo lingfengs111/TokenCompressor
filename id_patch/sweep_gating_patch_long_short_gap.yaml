@@ -14,10 +14,16 @@ parameters:
     value: "cuda:0"
   seed:
     value: 2026
+  checkpoint_mode:
+    value: "delta"
   patch_routing:
     distribution: categorical
     values: ["learned", "user_table"]
     probabilities: [0.67, 0.33]
+  num_patches:
+    values: [4, 8, 12, 16, 24, 32]
+  patch_len:
+    values: [4, 8, 12, 16, 20, 24, 30, 40]
   prefix_len:
     values: [0, 2]
   prefix_tail_positions:
@@ -52,3 +58,9 @@ parameters:
     value: 4
   batch_size:
     value: 1024
+  num_workers:
+    value: 4
+  pin_memory:
+    value: true
+  persistent_workers:
+    value: true

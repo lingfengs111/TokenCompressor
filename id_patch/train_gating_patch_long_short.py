@@ -390,9 +390,9 @@ class SASRecConfig:
     eval_before_train: bool = False  # Run baseline/meta eval before training
     eval_after_train: bool = True  # Run val eval after training
     # DataLoader settings (vectorized batch building)
-    num_workers: int = 0
+    num_workers: int = 4
     prefetch_factor: int = 2
-    persistent_workers: bool = False
+    persistent_workers: bool = True
     pin_memory: bool = True
     enable_timing: bool = False  # Log timing breakdowns for profiling
     timing_window: int = 50  # Number of steps per timing average

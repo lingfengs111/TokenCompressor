@@ -2698,7 +2698,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     apply_overrides_from_args(config, args)
 
-    project_name = os.getenv("WANDB_PROJECT") or f"gating_patch_long_short-{config.dataset}"
+    project_name = os.getenv("WANDB_PROJECT") or f"gating_patch_long_short-{config.dataset}_remote"
     run = wandb.init(project=project_name, config=config.__dict__)
     if run is not None:
         apply_overrides_from_dict(config, dict(run.config))
