@@ -17,9 +17,7 @@ parameters:
   checkpoint_mode:
     value: "delta"
   patch_routing:
-    distribution: categorical
     values: ["learned", "user_table"]
-    probabilities: [0.67, 0.33]
   num_patches:
     values: [4, 8, 12, 16, 24, 32]
   patch_len:
