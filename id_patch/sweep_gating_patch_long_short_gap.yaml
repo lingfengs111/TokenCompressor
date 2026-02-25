@@ -1,5 +1,5 @@
-program: /home/lingfengs111/codes/soft_patch_training/id_patch/train_gating_patch_long_short.py
-project: gating_patch_long_short-taobao_loo202
+program: /home/lingfengs111/codes/soft_patch_training/id_patch/train_gating_patch_long_short_remote.py
+project: gating_patch_long_short-taobao_loo202_remote
 method: random
 metric:
   name: val/meta_patch_ndcg@10
