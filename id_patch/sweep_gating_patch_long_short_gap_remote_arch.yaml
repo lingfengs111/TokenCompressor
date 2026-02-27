@@ -37,7 +37,7 @@ parameters:
   inner_steps:
     value: 2
   meta_truncate_steps:
-    value: [1, 3]
+    values: [1, 3]
   inner_lr:
     value: 1e-4
   inner_reset_every:
