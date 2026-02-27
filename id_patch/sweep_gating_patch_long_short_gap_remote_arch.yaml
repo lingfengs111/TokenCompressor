@@ -50,6 +50,10 @@ parameters:
     value: 0
   outer_tail_weight:
     value: 1.0
+  outer_gt_weight:
+    value: 1.0
+  outer_mid_rel_weight:
+    value: 0.0
   eval_after_train:
     value: false
   eval_sample_size:

@@ -204,6 +204,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--outer_tail_weight", type=float, default=None)
     parser.add_argument("--outer_mid_weight", type=float, default=None)
     parser.add_argument("--outer_mid_samples", type=int, default=None)
+    parser.add_argument("--outer_gt_weight", type=float, default=None)
+    parser.add_argument("--outer_mid_rel_weight", type=float, default=None)
     parser.add_argument("--inner_loss_mode", type=str, default=None)
     parser.add_argument("--prefix_len", type=int, default=None)
     parser.add_argument("--prefix_tail_positions", type=_str2bool, default=None)
@@ -359,6 +361,8 @@ class SASRecConfig:
     outer_tail_weight: float = 1.0  # weight for tail distillation (0 disables)
     outer_mid_weight: float = 1.0  # weight for middle-segment distillation (0 disables)
     outer_mid_samples: int = 0  # number of middle positions to distill (0 => patch_len)
+    outer_gt_weight: float = 1.0  # weight for direct GT loss on short+patch (0 disables)
+    outer_mid_rel_weight: float = 0.0  # weight for relational mid-segment alignment (0 disables)
     inner_loss_mode: str = "match_outer"  # match_outer | all | last | decay
     prefix_len: int = 5  # number of prefix tokens to retain in short-view inputs
     prefix_tail_positions: bool = True  # align prefix to start and tail to end positions
@@ -494,6 +498,8 @@ class SASRecConfig:
         logger.info(f"  outer_tail_weight: {self.outer_tail_weight}")
         logger.info(f"  outer_mid_weight: {self.outer_mid_weight}")
         logger.info(f"  outer_mid_samples: {self.outer_mid_samples}")
+        logger.info(f"  outer_gt_weight: {self.outer_gt_weight}")
+        logger.info(f"  outer_mid_rel_weight: {self.outer_mid_rel_weight}")
         logger.info(f"  inner_loss_mode: {self.inner_loss_mode}")
         logger.info(f"  prefix_len: {self.prefix_len}")
         logger.info(f"  prefix_tail_positions: {self.prefix_tail_positions}")
@@ -625,6 +631,7 @@ def _build_run_name(config: SASRecConfig) -> str:
         suffix.append(f"ir{config.inner_reset_every}")
     suffix.append(f"tw{_format_run_float(float(getattr(config, 'outer_tail_weight', 1.0)))}")
     suffix.append(f"mw{_format_run_float(float(getattr(config, 'outer_mid_weight', 0.0)))}")
+    suffix.append(f"gw{_format_run_float(float(getattr(config, 'outer_gt_weight', 1.0)))}")
     return base + "-" + "-".join(suffix)
 
 
@@ -2022,6 +2029,7 @@ def train_sasrec_meta(
     ) -> torch.Tensor:
         nonlocal last_outer_mid_loss
         nonlocal last_outer_tail_loss
+        nonlocal last_outer_gt_loss
         num_neg = max(1, int(getattr(config, "outer_neg_samples", 1)))
         if num_neg > 1:
             neg_long_ids = _build_outer_neg_ids(
@@ -2120,7 +2128,10 @@ def train_sasrec_meta(
         loss = tail_weight * tail_loss
 
         last_outer_mid_loss = None
+        last_outer_mid_rel_loss = None
+        last_outer_gt_loss = None
         mid_weight = float(getattr(config, "outer_mid_weight", 0.0))
+        mid_rel_weight = float(getattr(config, "outer_mid_rel_weight", 0.0))
         if mid_weight > 0 and config.patch_len > 0:
             mid_samples = int(getattr(config, "outer_mid_samples", 0))
             if mid_samples <= 0:
@@ -2167,7 +2178,10 @@ def train_sasrec_meta(
                             "use_patch": True,
                         },
                     )
-                    patch_hidden = hidden_states[:, :mid_samples, :]
+                    patch_start = 0
+                    if getattr(config, "patch_after_prefix", False) and int(getattr(config, "prefix_len", 0) or 0) > 0:
+                        patch_start = int(getattr(config, "prefix_len", 0) or 0)
+                    patch_hidden = hidden_states[:, patch_start : patch_start + mid_samples, :]
                     head_params = _collect_head_params_from_params(model, params, config)
                     patch_proj = model.apply_head(patch_hidden, head_params=head_params)
 
@@ -2187,6 +2201,52 @@ def train_sasrec_meta(
                         mid_loss = mid_raw[mid_valid].mean()
                         loss = loss + mid_weight * mid_loss
                         last_outer_mid_loss = mid_loss.item()
+
+                    if mid_rel_weight != 0.0 and mid_mask.any():
+                        # Relational alignment between patch hidden and teacher mid hidden.
+                        with torch.no_grad():
+                            teacher_hidden = functional_call(
+                                model,
+                                {**base_params, **base_buffers},
+                                args=(),
+                                kwargs={
+                                    "input_ids": long_input_ids,
+                                    "patch_params": eta_tensor,
+                                    "user_ids": user_ids,
+                                    "return_gating": False,
+                                    "use_patch": False,
+                                },
+                            )
+                        teacher_mid = teacher_hidden.gather(
+                            1, mid_idx.unsqueeze(-1).expand(-1, -1, teacher_hidden.size(-1))
+                        )
+                        # Mask out invalid positions by zeroing and selecting only valid rows.
+                        valid_rows = mid_mask.sum(dim=1) == mid_samples
+                        if valid_rows.any():
+                            stud = patch_hidden[valid_rows]
+                            teach = teacher_mid[valid_rows]
+                            stud = F.normalize(stud, dim=-1)
+                            teach = F.normalize(teach, dim=-1)
+                            s_rel = stud @ stud.transpose(1, 2)
+                            t_rel = teach @ teach.transpose(1, 2)
+                            rel_loss = F.mse_loss(s_rel, t_rel)
+                            loss = loss + mid_rel_weight * rel_loss
+                            last_outer_mid_rel_loss = rel_loss.item()
+
+        gt_weight = float(getattr(config, "outer_gt_weight", 1.0))
+        if gt_weight != 0.0:
+            pos_loss = bce_criterion(pos_short, torch.ones_like(pos_short))
+            neg_loss = bce_criterion(neg_short, torch.zeros_like(neg_short))
+            if neg_loss.dim() == 3:
+                neg_loss = neg_loss.mean(dim=-1)
+            gt_raw = pos_loss + neg_loss
+            gt_valid = short_pos_ids != 0
+            gt_mode = getattr(config, "outer_loss_mode", "all")
+            gt_loss = _reduce_loss(gt_raw, gt_valid, gt_mode, config.outer_loss_decay)
+            if isinstance(gt_loss, torch.Tensor):
+                if gt_valid.any():
+                    last_outer_gt_loss = gt_loss.item()
+            loss = loss + gt_weight * gt_loss
 
         return loss
 
@@ -2225,6 +2285,8 @@ def train_sasrec_meta(
     last_outer_loss = None
     last_outer_tail_loss = None
     last_outer_mid_loss = None
+    last_outer_mid_rel_loss = None
+    last_outer_gt_loss = None
     best_val_metrics = {"ndcg@10": 0.0, "hr@10": 0.0}
     best_ckpt_path: Optional[Path] = None
     timing_enabled = bool(getattr(config, "enable_timing", False))
@@ -2518,6 +2580,10 @@ def train_sasrec_meta(
                         outer_log["meta/outer_tail_loss"] = last_outer_tail_loss
                     if last_outer_mid_loss is not None:
                         outer_log["meta/outer_mid_loss"] = last_outer_mid_loss
+                    if last_outer_mid_rel_loss is not None:
+                        outer_log["meta/outer_mid_rel_loss"] = last_outer_mid_rel_loss
+                    if last_outer_gt_loss is not None:
+                        outer_log["meta/outer_gt_loss"] = last_outer_gt_loss
                     log_metrics(outer_log)
                 if timing_enabled:
                     log_ms = (time.perf_counter() - t_log_start) * 1000.0

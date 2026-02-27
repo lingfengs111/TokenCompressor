@@ -15,6 +15,7 @@ logs/
 checkpoints/
 wandb/
 pic/
+id_patch/remote/
 
 # 忽略临时文件
 *.log
