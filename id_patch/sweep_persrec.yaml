@@ -1,0 +1,72 @@
+program: /home/lingfengs111/codes/soft_patch_training/id_patch/train_Persrec.py
+project: persrec-taobao_loo202
+method: random
+metric:
+  name: val/ndcg@10
+  goal: maximize
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+parameters:
+  device:
+    value: "cuda:0"
+  dataset:
+    value: "taobao_loo202"
+  checkpoint_dir:
+    value: "/home/lingfengs111/codes/soft_patch_training/checkpoints/persrec_sweep"
+  seed:
+    value: 2026
+
+  # Sequence setup
+  max_seq_length:
+    value: 202
+  eval_seq_length:
+    value: 20
+  persrec_eval_use_full_seq:
+    value: true
+  persrec_num_tokens:
+    values: [4, 8, 16]
+
+  # Initialization
+  pretrained_ckpt_path:
+    value: "/home/lingfengs111/codes/soft_patch_training/checkpoints/sasrec_loo_standard/sasrec_taobao_loo202_seq202_dim128_L2_H1_best.pt"
+  infer_ckpt_config:
+    value: true
+  preserve_max_seq_length:
+    value: true
+  strict_load_pretrained:
+    value: false
+
+  # Optimization
+  batch_size:
+    value: 512
+  num_epochs:
+    value: 50
+  scheduler_type:
+    value: "cosine"
+  max_learning_rate:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1.5e-4
+  min_learning_rate:
+    values: [1e-6, 5e-6]
+  weight_decay:
+    values: [0.0, 1e-5, 1e-4]
+  grad_clip:
+    value: 1.0
+  dropout_rate:
+    values: [0.1, 0.2, 0.3]
+
+  # Training / eval bookkeeping
+  eval_sample_size:
+    value: 1000
+  steps_per_train_log:
+    value: 100
+  steps_per_val_log:
+    value: 1000
+  early_stop_patience:
+    value: 5
+  drop_unseen_items:
+    value: true

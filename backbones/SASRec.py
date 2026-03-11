@@ -1,7 +1,7 @@
-"""SASRec backbone with meta-patch and projection head."""
+"""SASRec backbone with meta-patch, projection head, and optional PEFT adapters."""
 
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -31,10 +31,82 @@ def _sdpa_kernel_context(enable_flash: bool, enable_mem_efficient: bool, enable_
         )
 
 
+def _parse_block_selection(spec: str, num_blocks: int) -> Set[int]:
+    text = str(spec or "none").strip().lower()
+    if not text or text == "none" or num_blocks <= 0:
+        return set()
+    if text == "all":
+        return set(range(num_blocks))
+
+    selected: Set[int] = set()
+    for token in (part.strip() for part in text.split(",")):
+        if not token:
+            continue
+        if token == "first":
+            selected.add(0)
+            continue
+        if token == "last":
+            selected.add(num_blocks - 1)
+            continue
+        idx = int(token)
+        if idx < 0:
+            idx += num_blocks
+        if idx < 0 or idx >= num_blocks:
+            raise ValueError(f"attn_lora_blocks index out of range: {token}")
+        selected.add(idx)
+    return selected
+
+
+class LowRankLinearAdapter(nn.Module):
+    """LoRA-style low-rank delta initialized to preserve the base linear layer."""
+
+    def __init__(self, in_features: int, out_features: int, rank: int, alpha: float) -> None:
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("LowRankLinearAdapter rank must be > 0.")
+        self.rank = int(rank)
+        self.scale = float(alpha if alpha > 0 else rank) / float(rank)
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=False)
+        nn.init.normal_(self.down.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x)) * self.scale
+
+
+class InputEmbeddingDelta(nn.Module):
+    """Input-only low-rank embedding delta so scorer embeddings stay anchored."""
+
+    def __init__(self, num_embeddings: int, hidden_units: int, rank: int, alpha: float) -> None:
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("InputEmbeddingDelta rank must be > 0.")
+        self.scale = float(alpha if alpha > 0 else rank) / float(rank)
+        self.rows = nn.Embedding(num_embeddings, rank, padding_idx=0)
+        self.proj = nn.Linear(rank, hidden_units, bias=False)
+        nn.init.normal_(self.rows.weight, mean=0.0, std=0.02)
+        if self.rows.padding_idx is not None:
+            with torch.no_grad():
+                self.rows.weight[self.rows.padding_idx].zero_()
+        nn.init.zeros_(self.proj.weight)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.rows(input_ids)) * self.scale
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head self-attention with causal mask."""
 
-    def __init__(self, hidden_units: int, num_heads: int, dropout_rate: float, use_flash_attention: bool = True):
+    def __init__(
+        self,
+        hidden_units: int,
+        num_heads: int,
+        dropout_rate: float,
+        use_flash_attention: bool = True,
+        lora_rank: int = 0,
+        lora_alpha: float = 1.0,
+    ):
         super().__init__()
         assert hidden_units % num_heads == 0
 
@@ -48,12 +120,20 @@ class CausalSelfAttention(nn.Module):
         self.hidden_units = hidden_units
         self.use_flash_attention = use_flash_attention
         self._flash_fallback_warned = False
+        self.c_attn_lora = (
+            LowRankLinearAdapter(hidden_units, 3 * hidden_units, lora_rank, lora_alpha) if lora_rank > 0 else None
+        )
+        self.c_proj_lora = (
+            LowRankLinearAdapter(hidden_units, hidden_units, lora_rank, lora_alpha) if lora_rank > 0 else None
+        )
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, T, C = x.size()  # batch, sequence length, hidden units
 
         # Calculate query, key, values for all heads in batch
         qkv = self.c_attn(x)
+        if self.c_attn_lora is not None:
+            qkv = qkv + self.c_attn_lora(x)
         q, k, v = qkv.split(self.hidden_units, dim=2)
 
         # Reshape for multi-head attention
@@ -99,7 +179,11 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # Output projection
-        y = self.resid_dropout(self.c_proj(y))
+        proj_input = y
+        y = self.c_proj(proj_input)
+        if self.c_proj_lora is not None:
+            y = y + self.c_proj_lora(proj_input)
+        y = self.resid_dropout(y)
         return y
 
 
@@ -126,10 +210,25 @@ class MLP(nn.Module):
 class TransformerBlock(nn.Module):
     """Transformer block with pre-LN architecture."""
 
-    def __init__(self, hidden_units: int, num_heads: int, dropout_rate: float, use_flash_attention: bool = True):
+    def __init__(
+        self,
+        hidden_units: int,
+        num_heads: int,
+        dropout_rate: float,
+        use_flash_attention: bool = True,
+        attn_lora_rank: int = 0,
+        attn_lora_alpha: float = 1.0,
+    ):
         super().__init__()
         self.ln_1 = nn.LayerNorm(hidden_units, eps=1e-8)
-        self.attn = CausalSelfAttention(hidden_units, num_heads, dropout_rate, use_flash_attention=use_flash_attention)
+        self.attn = CausalSelfAttention(
+            hidden_units,
+            num_heads,
+            dropout_rate,
+            use_flash_attention=use_flash_attention,
+            lora_rank=attn_lora_rank,
+            lora_alpha=attn_lora_alpha,
+        )
         self.ln_2 = nn.LayerNorm(hidden_units, eps=1e-8)
         self.ffn = MLP(hidden_units, dropout_rate)
 
@@ -159,6 +258,13 @@ class SASRec(nn.Module):
         # Embedding layers
         # +2 to reserve PAD=0 and UNK=1
         self.item_emb = nn.Embedding(item_num + 2, config.hidden_units, padding_idx=0)
+        input_emb_lora_rank = int(getattr(config, "input_emb_lora_rank", 0) or 0)
+        input_emb_lora_alpha = float(getattr(config, "input_emb_lora_alpha", input_emb_lora_rank or 1.0))
+        self.input_emb_lora = (
+            InputEmbeddingDelta(item_num + 2, config.hidden_units, input_emb_lora_rank, input_emb_lora_alpha)
+            if input_emb_lora_rank > 0
+            else None
+        )
         if self.persrec_enable:
             if self.persrec_num_tokens <= 0:
                 raise ValueError("persrec_num_tokens must be > 0 when persrec_enable=True.")
@@ -182,6 +288,12 @@ class SASRec(nn.Module):
         self.emb_dropout = nn.Dropout(config.dropout_rate)
 
         # Transformer blocks
+        attn_lora_rank = int(getattr(config, "attn_lora_rank", 0) or 0)
+        attn_lora_alpha = float(getattr(config, "attn_lora_alpha", attn_lora_rank or 1.0))
+        attn_lora_blocks = _parse_block_selection(
+            getattr(config, "attn_lora_blocks", "all" if attn_lora_rank > 0 else "none"),
+            config.num_blocks,
+        )
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
@@ -189,8 +301,10 @@ class SASRec(nn.Module):
                     config.num_heads,
                     config.dropout_rate,
                     use_flash_attention=config.use_flash_attention,
+                    attn_lora_rank=attn_lora_rank if i in attn_lora_blocks else 0,
+                    attn_lora_alpha=attn_lora_alpha,
                 )
-                for _ in range(config.num_blocks)
+                for i in range(config.num_blocks)
             ]
         )
 
@@ -223,6 +337,9 @@ class SASRec(nn.Module):
         """Freeze the transformer body (backbone)."""
         for p in self.item_emb.parameters():
             p.requires_grad = False
+        if self.input_emb_lora is not None:
+            for p in self.input_emb_lora.parameters():
+                p.requires_grad = False
         for p in self.pos_emb.parameters():
             p.requires_grad = False
         for block in self.blocks:
@@ -230,6 +347,12 @@ class SASRec(nn.Module):
                 p.requires_grad = False
         for p in self.ln_f.parameters():
             p.requires_grad = False
+
+    def _input_item_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        item_embs = self.item_emb(input_ids)
+        if self.input_emb_lora is not None:
+            item_embs = item_embs + self.input_emb_lora(input_ids)
+        return item_embs
 
     def _sequence_summary(self, item_embs: torch.Tensor, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return last-item embedding and sequence lengths."""
@@ -323,6 +446,55 @@ class SASRec(nn.Module):
         attn_mask = self._build_persrec_attention_mask_with_len(input_ids, pretrain_len)
         return hidden_states, attn_mask
 
+    def _build_persrec_target_sequence(
+        self, input_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Return raw item/token targets and an item-only loss mask.
+
+        This mirrors the original PerSRec training setup more closely:
+        the flattened sequence is [pretrain items, learnable tokens, recent items],
+        query positions correspond to that flattened sequence, and only item
+        positions participate in the loss. The final item position is masked out
+        because it has no next target.
+        """
+        batch_size, seq_length = input_ids.size()
+        pretrain_len, _ = self._resolve_persrec_lengths(seq_length)
+        item_embs = self.item_emb(input_ids)
+        token_embs = self.persrec_tokens.expand(batch_size, -1, -1)
+        targets = torch.cat(
+            [item_embs[:, :pretrain_len, :], token_embs, item_embs[:, pretrain_len:, :]],
+            dim=1,
+        )
+
+        item_valid = input_ids != 0
+        token_mask = torch.zeros(
+            (batch_size, self.persrec_num_tokens), dtype=torch.bool, device=input_ids.device
+        )
+        loss_mask = torch.cat(
+            [item_valid[:, :pretrain_len], token_mask, item_valid[:, pretrain_len:]],
+            dim=1,
+        )
+        if loss_mask.numel() > 0:
+            has_valid = loss_mask.any(dim=1)
+            last_from_end = loss_mask.flip(1).float().argmax(dim=1)
+            last_idx = loss_mask.size(1) - 1 - last_from_end
+            loss_mask = loss_mask.clone()
+            loss_mask[has_valid, last_idx[has_valid]] = False
+        return targets, loss_mask, pretrain_len
+
+    def _build_persrec_negative_sequence(
+        self, neg_ids: torch.Tensor, pretrain_len: int
+    ) -> torch.Tensor:
+        """Insert dummy token slots into negative embeddings to match query layout."""
+        neg_embs = self.item_emb(neg_ids)
+        if neg_embs.dim() == 4:
+            filler = neg_embs.new_zeros(
+                neg_embs.size(0), self.persrec_num_tokens, neg_embs.size(2), neg_embs.size(3)
+            )
+        else:
+            filler = neg_embs.new_zeros(neg_embs.size(0), self.persrec_num_tokens, neg_embs.size(2))
+        return torch.cat([neg_embs[:, :pretrain_len], filler, neg_embs[:, pretrain_len:]], dim=1)
+
     def _resolve_persrec_lengths(self, seq_length: int) -> Tuple[int, int]:
         recent_len = min(self.persrec_recent_len, seq_length)
         pretrain_len = max(seq_length - recent_len, 0)
@@ -354,7 +526,7 @@ class SASRec(nn.Module):
         batch_size, seq_length = input_ids.size()
 
         # Item embeddings
-        item_embs = self.item_emb(input_ids)
+        item_embs = self._input_item_embeddings(input_ids)
         item_embs *= self.hidden_units**0.5  # Scale by sqrt(d) as in Transformer
 
         # Patch embeddings (meta-patch)
@@ -439,7 +611,7 @@ class SASRec(nn.Module):
         patch_params: Optional[torch.Tensor] = None,
         user_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        item_embs = self.item_emb(input_ids)
+        item_embs = self._input_item_embeddings(input_ids)
         seq_summary, _ = self._sequence_summary(item_embs, input_ids)
         if patch_params is None:
             _, weights = self.meta_patch(seq_summary, user_ids=user_ids)
@@ -521,6 +693,7 @@ class SASRec(nn.Module):
         user_ids: Optional[torch.Tensor] = None,
         return_gating: bool = False,
         use_patch: bool = True,
+        return_loss_mask: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Training step with positive and negative items.
@@ -543,14 +716,16 @@ class SASRec(nn.Module):
         )
         if use_patch and self.patch_len > 0:
             hidden_states = hidden_states[:, self.patch_len :, :]
-        if self.persrec_enable and self.persrec_num_tokens > 0:
-            pre, _ = self._resolve_persrec_lengths(input_ids.size(1))
-            k = self.persrec_num_tokens
-            hidden_states = torch.cat([hidden_states[:, :pre, :], hidden_states[:, pre + k :, :]], dim=1)
-
         projected = self.apply_head(hidden_states, head_params=head_params)
-        pos_embs = self.item_emb(pos_ids)  # [B, T, H]
-        neg_embs = self.item_emb(neg_ids)  # [B, T, H] or [B, T, K, H]
+        if self.persrec_enable and self.persrec_num_tokens > 0:
+            target_seq, loss_mask, pretrain_len = self._build_persrec_target_sequence(input_ids)
+            pos_embs = projected.new_zeros(projected.shape)
+            pos_embs[:, :-1, :] = target_seq[:, 1:, :].to(projected.dtype)
+            neg_embs = self._build_persrec_negative_sequence(neg_ids, pretrain_len).to(projected.dtype)
+        else:
+            pos_embs = self.item_emb(pos_ids).to(projected.dtype)  # [B, T, H]
+            neg_embs = self.item_emb(neg_ids).to(projected.dtype)  # [B, T, H] or [B, T, K, H]
+            loss_mask = pos_ids != 0
 
         pos_logits = (projected * pos_embs).sum(dim=-1)  # [B, T]
         if neg_embs.dim() == 4:
@@ -558,6 +733,10 @@ class SASRec(nn.Module):
         else:
             neg_logits = (projected * neg_embs).sum(dim=-1)  # [B, T]
 
+        if return_gating and return_loss_mask:
+            return pos_logits, neg_logits, gating_weights, loss_mask
+        if return_loss_mask:
+            return pos_logits, neg_logits, loss_mask
         if return_gating:
             return pos_logits, neg_logits, gating_weights
         return pos_logits, neg_logits

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Train PersRec-style SASRec with learnable tokens and segment masking."""
 
+import argparse
 import os
 import sys
 import random
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
@@ -38,13 +40,47 @@ def set_global_seed(seed: int, deterministic: bool = False) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-DEFAULT_SHORT_CKPT = (
-    "/home/lingfengs111/codes/soft_patch_training/checkpoints/sasrec_loo_standard/"
-    "sasrec_taobao_loo202_seq50_dim128_L2_H1_best.pt"
-)
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def none_or_str(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text.lower() in {"", "none", "null"}:
+        return None
+    return text
+
+
+def none_or_int(value: Optional[str]) -> Optional[int]:
+    text = none_or_str(value)
+    if text is None:
+        return None
+    return int(text)
+
+
+def parse_int_list(value: Optional[str]) -> List[int]:
+    text = none_or_str(value)
+    if text is None:
+        return []
+    return [int(part.strip()) for part in text.split(",") if part.strip()]
+
 DEFAULT_LONG_CKPT = (
     "/home/lingfengs111/codes/soft_patch_training/checkpoints/sasrec_loo_standard/"
     "sasrec_taobao_loo202_seq202_dim128_L2_H1_best.pt"
+)
+DEFAULT_SHORT_CKPT = (
+    "/home/lingfengs111/codes/soft_patch_training/checkpoints/sasrec_loo_standard/"
+    "sasrec_taobao_loo202_seq50_dim128_L2_H1_best.pt"
 )
 
 
@@ -82,8 +118,8 @@ class BaselineConfig:
     persrec_recent_len: Optional[int] = None
 
     # Evaluation
-    eval_seq_length: int = 50  # Short-view length for eval truncation
-    persrec_eval_use_full_seq: bool = False  # If True, eval uses full long sequence
+    eval_seq_length: int = 20  # Short-view length for eval truncation
+    persrec_eval_use_full_seq: bool = True  # If True, eval uses full long sequence
 
     # Device
     device: str = "cuda:2"
@@ -127,7 +163,7 @@ class BaselineConfig:
     # Checkpoint loading
     strict_load_pretrained: bool = False
     ckpt_prefix_to_strip: Optional[str] = None
-    pretrained_ckpt_path: str = DEFAULT_SHORT_CKPT
+    pretrained_ckpt_path: Optional[str] = DEFAULT_LONG_CKPT
 
     infer_ckpt_config: bool = True
     preserve_max_seq_length: bool = True
@@ -801,15 +837,16 @@ def train_persrec(
             pos_ids = batch["pos_ids"].to(device, non_blocking=True)
             neg_ids = batch["neg_ids"].to(device, non_blocking=True)
 
-            pos_logits, neg_logits = model.training_step(
+            pos_logits, neg_logits, loss_mask = model.training_step(
                 input_ids,
                 pos_ids,
                 neg_ids,
                 patch_params=None,
                 use_patch=False,
+                return_loss_mask=True,
             )
 
-            valid_mask = pos_ids != 0
+            valid_mask = loss_mask
             if valid_mask.any():
                 pos_loss = bce_criterion(pos_logits, torch.ones_like(pos_logits))
                 neg_loss = bce_criterion(neg_logits, torch.zeros_like(neg_logits))
@@ -935,61 +972,16 @@ def train_persrec(
     return best_val_metrics
 
 
-if __name__ == "__main__":
-    config = BaselineConfig()
-    # === PersRec preset: long-train (200), short-eval (50) ===
-    # Short backbone -> long fine-tune -> short test
-    config.pretrained_ckpt_path = DEFAULT_SHORT_CKPT
-    # config.pretrained_ckpt_path = DEFAULT_LONG_CKPT  # optional: start from long ckpt
-    config.max_seq_length = 200
-    config.eval_seq_length = 50
-    config.persrec_enable = True
-    config.persrec_num_tokens = 10
-    config.persrec_pretrain_len = None
-    config.persrec_recent_len = None
-    config.persrec_eval_use_full_seq = False
-    config.batch_size = 512
-    config.num_epochs = 50
-    config.max_learning_rate = 5e-5
-    config.min_learning_rate = 5e-6
-    config.scheduler_type = "cosine"
-    config.warmup_steps = 100
-    config.weight_decay = 0.0
-    config.grad_clip = 1.0
-    config.eval_sample_size = 1000
-    config.early_stop_patience = 5
-    config.strict_load_pretrained = False
-    config.infer_ckpt_config = True
-    config.preserve_max_seq_length = True
-    config.drop_unseen_items = True
-
-    resolve_dataset_config(config)
-    set_global_seed(config.seed, config.deterministic)
-    desired_max_seq_length = config.max_seq_length
-
-    inferred_state = None
-    if config.pretrained_ckpt_path and Path(config.pretrained_ckpt_path).exists():
-        ckpt = load_checkpoint(config.pretrained_ckpt_path, trust_pickle=True)
-        inferred_state = _strip_module_prefix(_extract_state_dict(ckpt))
-        inferred_state = _maybe_strip_prefix(inferred_state, config.ckpt_prefix_to_strip)
-        if config.infer_ckpt_config:
-            config = infer_config_from_state_dict(inferred_state, config)
-            if config.preserve_max_seq_length and desired_max_seq_length is not None:
-                config.max_seq_length = desired_max_seq_length
-    else:
-        logger.warning("Pretrained checkpoint not found; proceeding without inference.")
-
+def run_persrec_experiment(config: BaselineConfig, inferred_state: Optional[Dict[str, torch.Tensor]]) -> None:
     resolve_persrec_config(config)
 
     device_manager = DeviceManager(logger, preferred_device=config.device, gpu_id=None)
     device = device_manager.device
 
-    persrec_suffix = ""
-    if config.persrec_enable:
-        persrec_suffix = (
-            f"-PersRecT{config.persrec_num_tokens}"
-            f"-pre{config.persrec_pretrain_len}-rec{config.persrec_recent_len}"
-        )
+    persrec_suffix = (
+        f"-PersRecT{config.persrec_num_tokens}"
+        f"-pre{config.persrec_pretrain_len}-rec{config.persrec_recent_len}"
+    )
     run_name = (
         f"{config.backbone}-persrec-"
         f"{config.dataset}-L{config.num_blocks}-H{config.hidden_units}-"
@@ -1085,3 +1077,166 @@ if __name__ == "__main__":
 
     wandb.finish()
     logger.info("PersRec training complete!")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train PersRec-style SASRec baseline.")
+    parser.add_argument("--dataset", type=str, default=None)
+    parser.add_argument("--data_dir", type=none_or_str, default=None)
+    parser.add_argument("--checkpoint_dir", type=none_or_str, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--deterministic", type=str2bool, default=None)
+
+    parser.add_argument("--max_seq_length", type=none_or_int, default=None)
+    parser.add_argument("--hidden_units", type=int, default=None)
+    parser.add_argument("--num_blocks", type=int, default=None)
+    parser.add_argument("--num_heads", type=int, default=None)
+    parser.add_argument("--dropout_rate", type=float, default=None)
+    parser.add_argument("--right_align_positions", type=str2bool, default=None)
+    parser.add_argument("--use_flash_attention", type=str2bool, default=None)
+    parser.add_argument("--use_gradient_checkpointing", type=str2bool, default=None)
+
+    parser.add_argument("--persrec_enable", type=str2bool, default=None)
+    parser.add_argument("--persrec_num_tokens", type=int, default=None)
+    parser.add_argument("--persrec_pretrain_len", type=none_or_int, default=None)
+    parser.add_argument("--persrec_recent_len", type=none_or_int, default=None)
+    parser.add_argument("--persrec_eval_use_full_seq", type=str2bool, default=None)
+    parser.add_argument("--eval_seq_length", type=int, default=None)
+    parser.add_argument("--token_sweep", type=none_or_str, default=None)
+
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--num_epochs", type=int, default=None)
+    parser.add_argument("--max_learning_rate", type=float, default=None)
+    parser.add_argument("--min_learning_rate", type=float, default=None)
+    parser.add_argument("--scheduler_type", type=str, default=None)
+    parser.add_argument("--warmup_steps", type=int, default=None)
+    parser.add_argument("--warmup_start_lr", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--grad_clip", type=float, default=None)
+    parser.add_argument("--steps_per_train_log", type=int, default=None)
+    parser.add_argument("--steps_per_val_log", type=int, default=None)
+    parser.add_argument("--eval_sample_size", type=int, default=None)
+    parser.add_argument("--early_stop_patience", type=int, default=None)
+
+    parser.add_argument("--drop_unseen_items", type=str2bool, default=None)
+    parser.add_argument("--strict_load_pretrained", type=str2bool, default=None)
+    parser.add_argument("--ckpt_prefix_to_strip", type=none_or_str, default=None)
+    parser.add_argument("--pretrained_ckpt_path", type=none_or_str, default=None)
+    parser.add_argument("--infer_ckpt_config", type=str2bool, default=None)
+    parser.add_argument("--preserve_max_seq_length", type=str2bool, default=None)
+    parser.add_argument("--save_best", type=str2bool, default=None)
+    parser.add_argument("--save_item_embeddings", type=str2bool, default=None)
+    return parser
+
+
+def apply_cli_overrides(config: BaselineConfig, args: argparse.Namespace) -> BaselineConfig:
+    mapping = {
+        "dataset": "dataset",
+        "device": "device",
+        "seed": "seed",
+        "deterministic": "deterministic",
+        "max_seq_length": "max_seq_length",
+        "hidden_units": "hidden_units",
+        "num_blocks": "num_blocks",
+        "num_heads": "num_heads",
+        "dropout_rate": "dropout_rate",
+        "right_align_positions": "right_align_positions",
+        "use_flash_attention": "use_flash_attention",
+        "use_gradient_checkpointing": "use_gradient_checkpointing",
+        "persrec_enable": "persrec_enable",
+        "persrec_num_tokens": "persrec_num_tokens",
+        "persrec_pretrain_len": "persrec_pretrain_len",
+        "persrec_recent_len": "persrec_recent_len",
+        "persrec_eval_use_full_seq": "persrec_eval_use_full_seq",
+        "eval_seq_length": "eval_seq_length",
+        "batch_size": "batch_size",
+        "num_epochs": "num_epochs",
+        "max_learning_rate": "max_learning_rate",
+        "min_learning_rate": "min_learning_rate",
+        "scheduler_type": "scheduler_type",
+        "warmup_steps": "warmup_steps",
+        "warmup_start_lr": "warmup_start_lr",
+        "weight_decay": "weight_decay",
+        "grad_clip": "grad_clip",
+        "steps_per_train_log": "steps_per_train_log",
+        "steps_per_val_log": "steps_per_val_log",
+        "eval_sample_size": "eval_sample_size",
+        "early_stop_patience": "early_stop_patience",
+        "drop_unseen_items": "drop_unseen_items",
+        "strict_load_pretrained": "strict_load_pretrained",
+        "ckpt_prefix_to_strip": "ckpt_prefix_to_strip",
+        "pretrained_ckpt_path": "pretrained_ckpt_path",
+        "infer_ckpt_config": "infer_ckpt_config",
+        "preserve_max_seq_length": "preserve_max_seq_length",
+        "save_best": "save_best",
+        "save_item_embeddings": "save_item_embeddings",
+    }
+    for arg_name, attr_name in mapping.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            setattr(config, attr_name, value)
+
+    if args.data_dir is not None:
+        config.data_dir = Path(args.data_dir)
+    if args.checkpoint_dir is not None:
+        config.checkpoint_dir = Path(args.checkpoint_dir)
+    return config
+
+
+if __name__ == "__main__":
+    args = build_arg_parser().parse_args()
+    base_config = BaselineConfig()
+    # === PersRec preset: long-train, short-view comparison ===
+    # The original PerSRec setup is an end-to-end long-context personalized model.
+    # We keep warm-start optional, but default to the long checkpoint rather than
+    # the seq50 short model to avoid a mismatched transfer setup.
+    base_config.pretrained_ckpt_path = DEFAULT_LONG_CKPT
+    # base_config.pretrained_ckpt_path = None  # closest to the original repository: train from scratch
+    base_config.max_seq_length = None
+    base_config.eval_seq_length = 20
+    base_config.persrec_enable = True
+    base_config.persrec_num_tokens = 4
+    base_config.persrec_pretrain_len = None
+    base_config.persrec_recent_len = None
+    base_config.persrec_eval_use_full_seq = True
+    base_config.batch_size = 512
+    base_config.num_epochs = 50
+    base_config.max_learning_rate = 5e-5
+    base_config.min_learning_rate = 5e-6
+    base_config.scheduler_type = "cosine"
+    base_config.warmup_steps = 100
+    base_config.weight_decay = 0.0
+    base_config.grad_clip = 1.0
+    base_config.eval_sample_size = 1000
+    base_config.early_stop_patience = 5
+    base_config.strict_load_pretrained = False
+    base_config.infer_ckpt_config = True
+    base_config.preserve_max_seq_length = True
+    base_config.drop_unseen_items = True
+    base_config = apply_cli_overrides(base_config, args)
+
+    resolve_dataset_config(base_config)
+    set_global_seed(base_config.seed, base_config.deterministic)
+    desired_max_seq_length = base_config.max_seq_length
+
+    inferred_state = None
+    if base_config.pretrained_ckpt_path and Path(base_config.pretrained_ckpt_path).exists():
+        ckpt = load_checkpoint(base_config.pretrained_ckpt_path, trust_pickle=True)
+        inferred_state = _strip_module_prefix(_extract_state_dict(ckpt))
+        inferred_state = _maybe_strip_prefix(inferred_state, base_config.ckpt_prefix_to_strip)
+        if base_config.infer_ckpt_config:
+            base_config = infer_config_from_state_dict(inferred_state, base_config)
+            if base_config.preserve_max_seq_length and desired_max_seq_length is not None:
+                base_config.max_seq_length = desired_max_seq_length
+    else:
+        logger.warning("Pretrained checkpoint not found; proceeding without inference.")
+
+    token_sweep = parse_int_list(args.token_sweep)
+    if not token_sweep:
+        token_sweep = [base_config.persrec_num_tokens]
+    for k in token_sweep:
+        config = copy.deepcopy(base_config)
+        config.persrec_num_tokens = k
+        set_global_seed(config.seed, config.deterministic)
+        run_persrec_experiment(config, inferred_state)
