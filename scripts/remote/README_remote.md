@@ -13,7 +13,9 @@ For the remote runs discussed on `2026-04-25`, the minimum remote tree should in
 - `run_sasrec_taobao_standard.py`
 - `run_hstu_taobao_standard.py`
 - `run_lru_taobao_standard.py`
+- `run_longer_taobao_sample_softmax.py`
 - `train_backbone_standard.py`
+- `train_backbone_sample_softmax.py`
 - `core/loo_dataset.py`
 - `core/streaming_eval.py`
 - `backbones/SASRec.py`
@@ -41,6 +43,7 @@ bash scripts/remote/launch_remote_round1_ml10m_original_table.sh
 bash scripts/remote/launch_remote_round2_ml10m_original_prefix.sh
 bash scripts/remote/launch_remote_round3_ml10m_persrec.sh
 bash scripts/remote/launch_remote_round4_lru_backbones.sh
+bash scripts/remote/launch_remote_round5_ml10m_longer.sh
 ```
 
 Recommended execution order:
@@ -50,6 +53,7 @@ Recommended execution order:
 3. `launch_remote_round2_ml10m_original_prefix.sh`
 4. `launch_remote_round3_ml10m_persrec.sh`
 5. `launch_remote_round4_lru_backbones.sh`
+6. `launch_remote_round5_ml10m_longer.sh`
 
 What each script does:
 
@@ -66,6 +70,15 @@ What each script does:
   This depends on the sampled-softmax warm-start checkpoints already being present on remote.
 - `launch_remote_round4_lru_backbones.sh`
   Launches exploratory `LRU` backbone runs for `ML-10M` and `Xlong`, each with `full` and `short` training.
+- `launch_remote_round5_ml10m_longer.sh`
+  Launches the missing `ML-10M / others / LONGER` run using the current better recipe:
+  `sampled-softmax + similarity`.
+
+Queue helper:
+
+- `queue_remote_round5_ml10m_longer_after_lru_ml10m_short.sh`
+  Waits for `round4`'s `lru_ml10m_short_remote` process to finish, then launches `round5` on that freed GPU.
+  This is the easiest way to append the missing table cell after the already-running remote scheduler.
 
 Checkpoint prerequisites for `launch_remote_round3_ml10m_persrec.sh`:
 
