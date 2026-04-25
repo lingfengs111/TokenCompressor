@@ -14,7 +14,7 @@ ensure_ready
 cd "$ROOT"
 
 echo "[$(timestamp)] import sanity check"
-PYTHONPATH="$ROOT:${PYTHONPATH:-}" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$ROOT:$ROOT/id_patch:${PYTHONPATH:-}" "$PYTHON_BIN" - <<'PY'
 import importlib
 
 modules = [

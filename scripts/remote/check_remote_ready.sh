@@ -20,6 +20,7 @@ required_files=(
   "$ROOT/backbones/Mamba4Rec.py"
   "$ROOT/backbones/modules.py"
   "$ROOT/backbones/patch.py"
+  "$ROOT/id_patch/train_gating_patch_long_short.py"
   "$ROOT/id_patch/train_patch_first_order.py"
   "$ROOT/id_patch/train_Persrec.py"
 )
