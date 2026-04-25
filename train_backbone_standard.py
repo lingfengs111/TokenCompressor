@@ -33,6 +33,9 @@ from backbones.SASRec import SASRec as SASRecBackbone
 logger = setup_logger("train-backbone-standard", log_to_file=True)
 
 
+REPO_ROOT = Path(__file__).resolve().parent
+
+
 @dataclass
 class SASRecConfig:
     """Configuration for backbone training (LOO datasets)."""
@@ -40,7 +43,7 @@ class SASRecConfig:
     dataset: str = "taobao_loo202"
     data_dir: Optional[Path] = None
     data_txt_path: Optional[Path] = None
-    checkpoint_dir: Path = Path("/home/lingfengs111/codes/soft_patch_training/checkpoints")
+    checkpoint_dir: Path = REPO_ROOT / "checkpoints"
 
     # Model (shared)
     backbone: str = "hstu"  # sasrec | hstu | longer | fmlp | linrec | bert4rec | gru4rec | lru | mamba4rec

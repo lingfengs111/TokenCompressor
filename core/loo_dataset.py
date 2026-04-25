@@ -14,6 +14,9 @@ from torch.utils.data import Dataset
 from core.streaming_eval import resolve_train_cutoff
 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
 @dataclass(frozen=True)
 class LooDatasetSpec:
     name: str
@@ -39,15 +42,15 @@ class LooDatasetSpec:
 LOO_DATASETS = {
     "taobao_loo202": LooDatasetSpec(
         name="taobao_loo202",
-        root=Path("/home/lingfengs111/codes/soft_patch_training/data/taobao/loo_202"),
+        root=REPO_ROOT / "data" / "taobao" / "loo_202",
     ),
     "ml10m_loo202": LooDatasetSpec(
         name="ml10m_loo202",
-        root=Path("/home/lingfengs111/codes/soft_patch_training/data/movielens/ml-10m/loo_202"),
+        root=REPO_ROOT / "data" / "movielens" / "ml-10m" / "loo_202",
     ),
     "xlong_loo402": LooDatasetSpec(
         name="xlong_loo402",
-        root=Path("/home/lingfengs111/codes/soft_patch_training/data/xlong2018/loo_402"),
+        root=REPO_ROOT / "data" / "xlong2018" / "loo_402",
     ),
 }
 
