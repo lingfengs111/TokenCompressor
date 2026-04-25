@@ -21,6 +21,7 @@ from core.loo_dataset import LooSequenceDataset, resolve_loo_dataset, infer_loo_
 from backbones.FMLP import FMLP
 from backbones.LinRec import LinRec
 from backbones.LRU import LRU
+from backbones.Mamba4Rec import Mamba4Rec
 from backbones.Bert4rec import Bert4Rec
 from backbones.GRU4Rec import GRU4Rec
 from backbones.HSTU import HSTU
@@ -42,7 +43,7 @@ class SASRecConfig:
     checkpoint_dir: Path = Path("/home/lingfengs111/codes/soft_patch_training/checkpoints")
 
     # Model (shared)
-    backbone: str = "hstu"  # sasrec | hstu | longer | fmlp | linrec | bert4rec | gru4rec | lru
+    backbone: str = "hstu"  # sasrec | hstu | longer | fmlp | linrec | bert4rec | gru4rec | lru | mamba4rec
     max_seq_length: Optional[int] = None
     hidden_units: int = 128
     num_blocks: int = 2
@@ -113,6 +114,13 @@ class SASRecConfig:
     lru_num_blocks: Optional[int] = 2
     lru_dropout: Optional[float] = None
     lru_attn_dropout: Optional[float] = None
+
+    # Mamba4Rec-specific
+    mamba_num_layers: Optional[int] = None
+    mamba_d_state: int = 32
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
+    mamba_dropout: Optional[float] = None
 
     # Head (shared)
     enable_projection_head: bool = False
@@ -217,6 +225,10 @@ class SASRecConfig:
             self.lru_dropout = self.dropout_rate
         if self.lru_attn_dropout is None:
             self.lru_attn_dropout = self.dropout_rate
+        if self.mamba_num_layers is None:
+            self.mamba_num_layers = self.num_blocks
+        if self.mamba_dropout is None:
+            self.mamba_dropout = self.dropout_rate
 
     def log_config(self):
         """Log all configuration parameters."""
@@ -304,6 +316,13 @@ class SASRecConfig:
             logger.info(f"  lru_num_blocks: {self.lru_num_blocks}")
             logger.info(f"  lru_dropout: {self.lru_dropout}")
             logger.info(f"  lru_attn_dropout: {self.lru_attn_dropout}")
+        elif backbone in {"mamba4rec", "mamba"}:
+            logger.info("Mamba4Rec Parameters:")
+            logger.info(f"  mamba_num_layers: {self.mamba_num_layers}")
+            logger.info(f"  mamba_d_state: {self.mamba_d_state}")
+            logger.info(f"  mamba_d_conv: {self.mamba_d_conv}")
+            logger.info(f"  mamba_expand: {self.mamba_expand}")
+            logger.info(f"  mamba_dropout: {self.mamba_dropout}")
         else:
             logger.info("Backbone Parameters: (unknown backbone)")
 
@@ -593,8 +612,10 @@ def build_backbone(config: SASRecConfig, item_num: int) -> nn.Module:
         return GRU4Rec(config, item_num=item_num)
     if backbone_name == "lru":
         return LRU(config, item_num=item_num)
+    if backbone_name in {"mamba4rec", "mamba"}:
+        return Mamba4Rec(config, item_num=item_num)
     raise ValueError(
-        f"Unknown backbone '{config.backbone}'. Expected one of: sasrec, hstu, hstu_officialish, hstu_research_aligned, longer, fmlp, linrec, bert4rec, gru4rec, lru."
+        f"Unknown backbone '{config.backbone}'. Expected one of: sasrec, hstu, hstu_officialish, hstu_research_aligned, longer, fmlp, linrec, bert4rec, gru4rec, lru, mamba4rec."
     )
 
 

@@ -247,6 +247,16 @@ class LRU(nn.Module):
         for p in self.ln_f.parameters():
             p.requires_grad = False
 
+    def _strip_patch_tokens(self, hidden_states: torch.Tensor, seq_length: Optional[int] = None) -> torch.Tensor:
+        if self.patch_len <= 0:
+            return hidden_states
+        if seq_length is not None and hidden_states.size(1) == seq_length:
+            return hidden_states
+        return hidden_states[:, self.patch_len :, :]
+
+    def strip_patch_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self._strip_patch_tokens(hidden_states)
+
     def _sequence_summary(self, item_embs: torch.Tensor, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         valid_mask = input_ids != 0
         lengths = valid_mask.sum(dim=1)
@@ -396,7 +406,7 @@ class LRU(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.forward_features(input_ids, patch_params=patch_params, use_patch=use_patch)
         if use_patch and self.patch_len > 0:
-            hidden_states = hidden_states[:, self.patch_len :, :]
+            hidden_states = self._strip_patch_tokens(hidden_states, input_ids.size(1))
         final_hidden = hidden_states[:, -1, :]
         if use_head:
             final_hidden = self.apply_head(final_hidden, head_params=head_params)
@@ -418,7 +428,7 @@ class LRU(nn.Module):
             input_ids, patch_params=patch_params, return_gating=True, use_patch=use_patch
         )
         if use_patch and self.patch_len > 0:
-            hidden_states = hidden_states[:, self.patch_len :, :]
+            hidden_states = self._strip_patch_tokens(hidden_states, input_ids.size(1))
 
         projected = self.apply_head(hidden_states, head_params=head_params)
         pos_embs = self.embedding.token(pos_ids)

@@ -16,7 +16,7 @@ if [ -n "$BRANCH" ]; then
   git -C "$ROOT" pull --ff-only origin "$BRANCH"
 fi
 
-bash "$ROOT/scripts/remote/check_gpub005_ready.sh"
+bash "$ROOT/scripts/remote/check_remote_ready.sh"
 
 echo "[$(date '+%F %T')] launch sasrec_ml10m_original_full_dotbce_remote on cuda:${SASREC_GPU}"
 nohup "$PYTHON_BIN" "$ROOT/run_sasrec_taobao_standard.py" \

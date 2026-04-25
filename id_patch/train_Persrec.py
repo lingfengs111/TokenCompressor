@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Train PersRec-style SASRec with learnable tokens and segment masking."""
+"""Train PersRec-style backbone with learnable tokens and segment masking."""
 
 import argparse
+import math
 import os
 import sys
 import random
 import copy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -25,6 +26,15 @@ if ROOT_DIR not in sys.path:
 from core.device_manager import DeviceManager
 from core.logger import setup_logger
 from core.loo_dataset import LooSequenceDataset, resolve_loo_dataset, infer_loo_min_len
+from core.streaming_eval import (
+    finalize_eval_metrics,
+    flatten_streaming_eval_metrics,
+    normalize_eval_protocol,
+    resolve_eval_target_positions,
+    resolve_train_cutoff,
+    update_rank_metrics,
+)
+from backbones.HSTU import HSTU
 from backbones.SASRec import SASRec
 
 logger = setup_logger("train-persrec", log_to_file=True)
@@ -74,6 +84,14 @@ def parse_int_list(value: Optional[str]) -> List[int]:
         return []
     return [int(part.strip()) for part in text.split(",") if part.strip()]
 
+
+class _StoreProvided(argparse.Action):
+    """Argparse action that records whether an option was explicitly provided."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_provided", True)
+
 DEFAULT_LONG_CKPT = (
     "/home/lingfengs111/codes/soft_patch_training/checkpoints/sasrec_loo_standard/"
     "sasrec_taobao_loo202_seq202_dim128_L2_H1_best.pt"
@@ -94,15 +112,24 @@ class BaselineConfig:
     checkpoint_dir: Path = field(default_factory=lambda: Path("checkpoints") / "persrec")
 
     # Model parameters
-    backbone: str = "sasrec"  # sasrec | fmlp | linrec | bert4rec | gru4rec
+    backbone: str = "sasrec"  # sasrec | hstu | fmlp | linrec | bert4rec | gru4rec
     max_seq_length: Optional[int] = 200  # Long sequence length (items only)
     hidden_units: int = 128
     num_blocks: int = 2
     num_heads: int = 1
     dropout_rate: float = 0.2
     right_align_positions: bool = True
+    sasrec_attention_norm: str = "softmax"
     use_flash_attention: bool = False
     use_gradient_checkpointing: bool = False
+    hstu_linear_dim: Optional[int] = None
+    hstu_attention_dim: Optional[int] = None
+    hstu_linear_activation: str = "silu"
+    hstu_attn_dropout: Optional[float] = None
+    hstu_enable_relative_attention_bias: bool = False
+    hstu_normalization: str = "rel_bias"
+    hstu_concat_ua: bool = False
+    hstu_epsilon: float = 1e-6
 
     # Head (disabled by default for PersRec)
     head_residual: bool = False
@@ -110,6 +137,15 @@ class BaselineConfig:
     enable_projection_head: bool = False
     head_use_gelu: bool = False
     head_use_ln: bool = False
+
+    # Optional PEFT adapters
+    input_emb_lora_rank: int = 0
+    input_emb_lora_alpha: float = 8.0
+    train_input_emb_lora: bool = False
+    attn_lora_rank: int = 0
+    attn_lora_alpha: float = 8.0
+    attn_lora_blocks: str = "all"
+    train_attn_lora: bool = False
 
     # PersRec (learnable tokens + segment mask)
     persrec_enable: bool = True
@@ -120,6 +156,10 @@ class BaselineConfig:
     # Evaluation
     eval_seq_length: int = 20  # Short-view length for eval truncation
     persrec_eval_use_full_seq: bool = True  # If True, eval uses full long sequence
+    persrec_train_mode: str = "full"  # full | tokens | tokens_bias_ln | tokens_bias_ln_head
+    eval_protocol: str = "legacy_loo"  # legacy_loo | holdout_anchor
+    last_k_eval_test: int = 10  # Used when eval_protocol=holdout_anchor
+    streaming_eval_last_k: int = 0  # If >1, run extra rolling final-test eval on the last K targets
 
     # Device
     device: str = "cuda:2"
@@ -189,6 +229,7 @@ class BaselineConfig:
         logger.info(f"  num_heads: {self.num_heads}")
         logger.info(f"  dropout_rate: {self.dropout_rate}")
         logger.info(f"  right_align_positions: {self.right_align_positions}")
+        logger.info(f"  sasrec_attention_norm: {self.sasrec_attention_norm}")
         logger.info(f"  use_flash_attention: {self.use_flash_attention}")
         logger.info(f"  use_gradient_checkpointing: {self.use_gradient_checkpointing}")
 
@@ -199,6 +240,15 @@ class BaselineConfig:
         logger.info(f"  head_use_gelu: {self.head_use_gelu}")
         logger.info(f"  head_use_ln: {self.head_use_ln}")
 
+        logger.info("Adapter Parameters:")
+        logger.info(f"  input_emb_lora_rank: {self.input_emb_lora_rank}")
+        logger.info(f"  input_emb_lora_alpha: {self.input_emb_lora_alpha}")
+        logger.info(f"  train_input_emb_lora: {self.train_input_emb_lora}")
+        logger.info(f"  attn_lora_rank: {self.attn_lora_rank}")
+        logger.info(f"  attn_lora_alpha: {self.attn_lora_alpha}")
+        logger.info(f"  attn_lora_blocks: {self.attn_lora_blocks}")
+        logger.info(f"  train_attn_lora: {self.train_attn_lora}")
+
         logger.info("PersRec Settings:")
         logger.info(f"  eval_seq_length: {self.eval_seq_length}")
         logger.info(f"  persrec_enable: {self.persrec_enable}")
@@ -206,6 +256,10 @@ class BaselineConfig:
         logger.info(f"  persrec_pretrain_len: {self.persrec_pretrain_len}")
         logger.info(f"  persrec_recent_len: {self.persrec_recent_len}")
         logger.info(f"  persrec_eval_use_full_seq: {self.persrec_eval_use_full_seq}")
+        logger.info(f"  persrec_train_mode: {self.persrec_train_mode}")
+        logger.info(f"  eval_protocol: {self.eval_protocol}")
+        logger.info(f"  last_k_eval_test: {self.last_k_eval_test}")
+        logger.info(f"  streaming_eval_last_k: {self.streaming_eval_last_k}")
 
         logger.info("Training Parameters:")
         logger.info(f"  batch_size: {self.batch_size}")
@@ -308,6 +362,8 @@ def _maybe_strip_prefix(state_dict: Dict[str, torch.Tensor], prefix: Optional[st
 
 
 def infer_config_from_state_dict(state_dict: Dict[str, torch.Tensor], config: BaselineConfig) -> BaselineConfig:
+    if any(k.endswith(".uvqk") for k in state_dict.keys()):
+        config.backbone = "hstu"
     if "item_emb.weight" in state_dict:
         config.hidden_units = int(state_dict["item_emb.weight"].shape[1])
     if "pos_emb.weight" in state_dict:
@@ -325,6 +381,17 @@ def infer_config_from_state_dict(state_dict: Dict[str, torch.Tensor], config: Ba
     if block_indices:
         config.num_blocks = max(block_indices) + 1
 
+    if any(k.endswith(".rel_pos_bias.bias") for k in state_dict.keys()):
+        config.hstu_enable_relative_attention_bias = True
+
+    if "input_emb_lora.rows.weight" in state_dict:
+        config.input_emb_lora_rank = int(state_dict["input_emb_lora.rows.weight"].shape[1])
+    for key, value in state_dict.items():
+        if key.endswith(".attn.c_attn_lora.down.weight") and value.ndim == 2:
+            config.attn_lora_rank = int(value.shape[0])
+            config.attn_lora_blocks = "all"
+            break
+
     if config.hidden_units % config.num_heads != 0:
         logger.warning(
             "hidden_units (%s) not divisible by num_heads (%s). Forcing num_heads=1.",
@@ -332,6 +399,43 @@ def infer_config_from_state_dict(state_dict: Dict[str, torch.Tensor], config: Ba
             config.num_heads,
         )
         config.num_heads = 1
+    return config
+
+
+def apply_config_from_checkpoint_payload(config: BaselineConfig, ckpt_payload: Optional[Dict[str, Any]]) -> BaselineConfig:
+    if not isinstance(ckpt_payload, dict):
+        return config
+    ckpt_config = ckpt_payload.get("config")
+    if not isinstance(ckpt_config, dict):
+        return config
+
+    keys = [
+        "backbone",
+        "max_seq_length",
+        "hidden_units",
+        "num_blocks",
+        "num_heads",
+        "dropout_rate",
+        "right_align_positions",
+        "sasrec_attention_norm",
+        "use_flash_attention",
+        "use_gradient_checkpointing",
+        "hstu_linear_dim",
+        "hstu_attention_dim",
+        "hstu_linear_activation",
+        "hstu_attn_dropout",
+        "hstu_enable_relative_attention_bias",
+        "hstu_normalization",
+        "hstu_concat_ua",
+        "hstu_epsilon",
+    ]
+    applied = {}
+    for key in keys:
+        if key in ckpt_config and hasattr(config, key):
+            setattr(config, key, ckpt_config[key])
+            applied[key] = ckpt_config[key]
+    if applied:
+        logger.info("Applied architecture config from checkpoint: %s", applied)
     return config
 
 
@@ -349,6 +453,7 @@ def load_pretrained_backbone(
     state_dict = _maybe_strip_prefix(state_dict, getattr(model.config, "ckpt_prefix_to_strip", None))
     filtered = {}
     pos_weight = None
+    rel_bias_weights: Dict[str, torch.Tensor] = {}
     model_state = model.state_dict()
     for k, v in state_dict.items():
         if k not in model_state and not k.startswith("item_emb.") and not k.startswith("pos_emb."):
@@ -374,6 +479,11 @@ def load_pretrained_backbone(
             pos_weight = v
             if hasattr(model, "pos_emb") and v.shape == model.pos_emb.weight.shape:
                 filtered[k] = v
+        elif k.endswith(".rel_pos_bias.bias") and k in model_state:
+            if v.shape == model_state[k].shape:
+                filtered[k] = v
+            elif v.ndim == 1 and model_state[k].ndim == 1:
+                rel_bias_weights[k] = v
         elif k in model_state and v.shape == model_state[k].shape:
             filtered[k] = v
     missing, unexpected = model.load_state_dict(filtered, strict=False)
@@ -403,6 +513,33 @@ def load_pretrained_backbone(
                     pos_weight.shape,
                     model.pos_emb.weight.shape,
                 )
+    for key, src_weight in rel_bias_weights.items():
+        target = model_state.get(key)
+        if target is None:
+            continue
+        src_len = int(src_weight.numel())
+        tgt_len = int(target.numel())
+        if src_len >= tgt_len or (tgt_len - src_len) % 2 != 0:
+            logger.warning(
+                "Skipped %s due to shape mismatch (ckpt=%s, model=%s).",
+                key,
+                tuple(src_weight.shape),
+                tuple(target.shape),
+            )
+            continue
+        offset = (tgt_len - src_len) // 2
+        with torch.no_grad():
+            param = model.get_parameter(key)
+            param.data[offset : offset + src_len].copy_(
+                src_weight.to(device=param.device, dtype=param.dtype)
+            )
+        logger.info(
+            "Expanded %s by center-aligning relative bias (ckpt=%s -> model=%s, offset=%s).",
+            key,
+            tuple(src_weight.shape),
+            tuple(target.shape),
+            offset,
+        )
 
 
 def initialize_head_as_identity(model: nn.Module) -> None:
@@ -449,8 +586,8 @@ def resolve_dataset_config(config: BaselineConfig) -> None:
 def resolve_persrec_config(config: BaselineConfig) -> None:
     if not config.persrec_enable:
         return
-    if config.backbone.lower() != "sasrec":
-        raise ValueError("PersRec is only implemented for SASRec in this script.")
+    if config.backbone.lower() not in {"sasrec", "hstu"}:
+        raise ValueError("PersRec is only implemented for SASRec/HSTU in this script.")
     if config.persrec_recent_len is None:
         config.persrec_recent_len = int(config.eval_seq_length)
     if config.persrec_pretrain_len is None:
@@ -470,6 +607,15 @@ def resolve_persrec_config(config: BaselineConfig) -> None:
         config.max_seq_length = total_len
     if config.persrec_num_tokens <= 0:
         raise ValueError("persrec_num_tokens must be > 0 when persrec_enable=True.")
+
+
+def resolve_eval_protocol_config(config: BaselineConfig) -> None:
+    config.eval_protocol = normalize_eval_protocol(getattr(config, "eval_protocol", "legacy_loo"))
+    config.last_k_eval_test = int(getattr(config, "last_k_eval_test", 0) or 0)
+    if config.eval_protocol != "legacy_loo" and config.last_k_eval_test < 2:
+        raise ValueError(
+            f"holdout_anchor protocol requires last_k_eval_test >= 2, got {config.last_k_eval_test}."
+        )
 
 
 def resolve_eval_truncate_len(config: BaselineConfig) -> Optional[int]:
@@ -494,9 +640,13 @@ class SequentialSampler:
         self.valid_user_seqs = []
         for user in dataset.users:
             seq = dataset.user_seq[user]
-            if len(seq) > 3:
-                # Leave-last-two-out for training.
-                self.valid_user_seqs.append((user, seq[:-2]))
+            train_end = resolve_train_cutoff(
+                len(seq),
+                eval_protocol=getattr(config, "eval_protocol", "legacy_loo"),
+                last_k_eval_test=int(getattr(config, "last_k_eval_test", 0) or 0),
+            )
+            if train_end > 1:
+                self.valid_user_seqs.append((user, seq[:train_end]))
 
     @staticmethod
     def sample_negative_item(min_id: int, max_id_exclusive: int, seen_items: set) -> int:
@@ -584,82 +734,65 @@ def evaluate(
     use_head: bool = True,
     max_seq_length: Optional[int] = None,
     truncate_len: Optional[int] = None,
+    streaming_last_k: int = 0,
 ) -> Dict[str, float]:
     model.eval()
 
     ndcg_sum = 0.0
     hr_sum = 0.0
     valid_users = 0
+    per_position: Dict[int, Dict[str, float]] = {}
+    saw_nonfinite_scores = False
 
     users = dataset.users
 
     for batch_start in range(0, len(users), batch_size):
         batch_users = users[batch_start : batch_start + batch_size]
-        batch_seqs = []
-        batch_targets = []
-        batch_valid_mask = []
+        batch_examples: List[Tuple[int, List[int], int, int]] = []
 
         for user in batch_users:
             seq = dataset.user_seq[user]
-
-            if mode == "val":
-                if len(seq) < 3:
-                    batch_valid_mask.append(False)
-                    batch_seqs.append([])
-                    batch_targets.append(0)
+            target_positions = resolve_eval_target_positions(
+                len(seq),
+                mode=mode,
+                streaming_last_k=streaming_last_k,
+                eval_protocol=getattr(config, "eval_protocol", "legacy_loo"),
+                last_k_eval_test=int(getattr(config, "last_k_eval_test", 0) or 0),
+            )
+            for target_idx in target_positions:
+                target = seq[target_idx]
+                if target == 1 and not config.drop_unseen_items:
                     continue
-                input_seq = seq[:-2]
-                target = seq[-2]
-            else:
-                if len(seq) < 2:
-                    batch_valid_mask.append(False)
-                    batch_seqs.append([])
-                    batch_targets.append(0)
-                    continue
-                input_seq = seq[:-1]
-                target = seq[-1]
+                batch_examples.append((user, seq[:target_idx], target, len(seq) - target_idx))
 
-            if target == 1 and not config.drop_unseen_items:
-                batch_valid_mask.append(False)
-                batch_seqs.append([])
-                batch_targets.append(0)
-                continue
-
-            batch_valid_mask.append(True)
-            batch_seqs.append(input_seq)
-            batch_targets.append(target)
-
-        if not any(batch_valid_mask):
+        if not batch_examples:
             continue
 
-        max_len = min(max(len(s) for s in batch_seqs if s), dataset.max_seq_length)
+        batch_seqs = [input_seq for _, input_seq, _, _ in batch_examples]
+        max_len = min(max(len(s) for s in batch_seqs), dataset.max_seq_length)
         if max_seq_length is not None and max_seq_length > 0:
             max_len = min(max_len, max_seq_length)
         use_len = max_len
         if truncate_len is not None and truncate_len > 0:
             use_len = min(truncate_len, max_len)
 
-        input_tensor = torch.zeros((len(batch_users), max_len), dtype=torch.long)
+        input_tensor = torch.zeros((len(batch_examples), max_len), dtype=torch.long)
 
         for i, seq in enumerate(batch_seqs):
-            if seq and batch_valid_mask[i]:
-                seq_len = min(len(seq), use_len)
-                input_tensor[i, -seq_len:] = torch.tensor(seq[-seq_len:])
+            seq_len = min(len(seq), use_len)
+            input_tensor[i, -seq_len:] = torch.tensor(seq[-seq_len:])
 
         input_tensor = input_tensor.to(device)
-
-        valid_indices = [i for i, valid in enumerate(batch_valid_mask) if valid]
-        if not valid_indices:
-            continue
-
-        valid_input = input_tensor[valid_indices]
-        valid_targets = [batch_targets[i] for i in valid_indices]
+        valid_input = input_tensor
+        valid_targets = [target for _, _, target, _ in batch_examples]
+        valid_user_ids = [user for user, _, _, _ in batch_examples]
+        valid_rel_positions = [rel_from_end for _, _, _, rel_from_end in batch_examples]
 
         with torch.no_grad():
             sample_size = max(2, config.eval_sample_size)
             candidates_list = []
             use_fixed_neg = hasattr(dataset, "neg_item_by_user")
-            for idx, user in enumerate([batch_users[i] for i in valid_indices]):
+            for idx, user in enumerate(valid_user_ids):
                 target = valid_targets[idx]
                 candidates = [target]
                 seen_items = {x for x in dataset.user_seq[user] if x > 1}
@@ -675,37 +808,163 @@ def evaluate(
             candidates_tensor = torch.stack(candidates_list, dim=0)
 
             scores = model.predict(valid_input, candidates_tensor, use_patch=False, use_head=use_head)
+            if not torch.isfinite(scores).all():
+                bad_examples = int((~torch.isfinite(scores).all(dim=1)).sum().item())
+                logger.error(
+                    "Non-finite PersRec scores during %s evaluation: %s/%s examples are invalid.",
+                    mode,
+                    f"{bad_examples:,}",
+                    f"{scores.size(0):,}",
+                )
+                saw_nonfinite_scores = True
+                break
 
         _, indices = torch.sort(scores, dim=1, descending=True)
         ranks = (indices == 0).nonzero(as_tuple=True)[1].cpu().numpy() + 1
 
-        for rank in ranks:
+        for rel_from_end, rank in zip(valid_rel_positions, ranks):
             valid_users += 1
+            update_rank_metrics(per_position, rel_from_end, int(rank))
             if rank <= 10:
                 hr_sum += 1
                 ndcg_sum += 1 / np.log2(rank + 1)
 
-    ndcg_10 = ndcg_sum / valid_users if valid_users > 0 else 0.0
-    hr_10 = hr_sum / valid_users if valid_users > 0 else 0.0
+    if saw_nonfinite_scores:
+        return {
+            "ndcg@10": float("nan"),
+            "hr@10": float("nan"),
+        }
 
-    logger.info(f"Evaluated on {valid_users:,} users")
+    eval_entity = "examples" if int(streaming_last_k or 0) > 1 else "users"
+    logger.info("Evaluated on %s %s", f"{valid_users:,}", eval_entity)
 
-    return {"ndcg@10": ndcg_10, "hr@10": hr_10}
+    return finalize_eval_metrics(
+        ndcg_sum=ndcg_sum,
+        hr_sum=hr_sum,
+        num_examples=valid_users,
+        per_position=per_position,
+        streaming_last_k=streaming_last_k,
+    )
 
 
 def build_backbone(config: BaselineConfig, item_num: int) -> nn.Module:
     name = getattr(config, "backbone", "sasrec").lower()
-    if name != "sasrec":
-        raise ValueError("PersRec script only supports SASRec backbone.")
-    return SASRec(config, item_num=item_num)
+    if name == "sasrec":
+        return SASRec(config, item_num=item_num)
+    if name == "hstu":
+        return HSTU(config, item_num=item_num)
+    raise ValueError(f"PersRec script only supports SASRec/HSTU backbone, got: {config.backbone}")
 
 
 def build_checkpoint_tag(config: BaselineConfig) -> str:
+    sasrec_suffix = ""
+    if config.backbone == "sasrec" and str(getattr(config, "sasrec_attention_norm", "softmax")).lower() == "softmax1":
+        sasrec_suffix = "_SM1"
     suffix = f"_PersRecT{config.persrec_num_tokens}"
+    train_mode = normalize_persrec_train_mode(config.persrec_train_mode)
+    if train_mode != "full":
+        suffix += f"_{persrec_train_mode_tag(train_mode)}"
+    if int(getattr(config, "input_emb_lora_rank", 0) or 0) > 0:
+        suffix += f"_iel{int(config.input_emb_lora_rank)}"
+    if int(getattr(config, "attn_lora_rank", 0) or 0) > 0:
+        suffix += f"_alr{int(config.attn_lora_rank)}"
     return (
         f"{config.backbone}_{config.dataset}_seq{config.max_seq_length}_dim{config.hidden_units}"
-        f"_L{config.num_blocks}_H{config.num_heads}{suffix}"
+        f"_L{config.num_blocks}_H{config.num_heads}{sasrec_suffix}{suffix}"
     )
+
+
+def normalize_persrec_train_mode(mode: Optional[str]) -> str:
+    text = str(mode or "full").strip().lower().replace("-", "_")
+    aliases = {
+        "full_ft": "full",
+        "full_finetune": "full",
+        "token": "tokens",
+        "tokens_only": "tokens",
+        "token_only": "tokens",
+        "tokens_bias": "tokens_bias_ln",
+        "tokens_bias_layernorm": "tokens_bias_ln",
+        "tokens_bitfit": "tokens_bias_ln",
+        "tokens_bias_ln_head": "tokens_bias_ln_head",
+        "tokens_bitfit_head": "tokens_bias_ln_head",
+    }
+    text = aliases.get(text, text)
+    valid = {"full", "tokens", "tokens_bias_ln", "tokens_bias_ln_head"}
+    if text not in valid:
+        raise ValueError(f"Unsupported persrec_train_mode: {mode}")
+    return text
+
+
+def persrec_train_mode_tag(mode: str) -> str:
+    tags = {
+        "full": "fullft",
+        "tokens": "pefttok",
+        "tokens_bias_ln": "peftbitfit",
+        "tokens_bias_ln_head": "peftbitfithead",
+    }
+    return tags[normalize_persrec_train_mode(mode)]
+
+
+def configure_persrec_trainable_params(model: nn.Module, config: BaselineConfig) -> str:
+    mode = normalize_persrec_train_mode(config.persrec_train_mode)
+    config.persrec_train_mode = mode
+
+    if mode == "full":
+        # full 模式就是把 backbone 整体当成普通微调来训。
+        for p in model.parameters():
+            p.requires_grad = True
+        return mode
+
+    # 非 full 模式先统一冻结，再按 train_mode 有选择地打开一小部分参数。
+    for p in model.parameters():
+        p.requires_grad = False
+
+    if hasattr(model, "persrec_tokens") and isinstance(model.persrec_tokens, torch.nn.Parameter):
+        # 不管是哪种 PEFT 模式，PersRec token 本身都必须可训练。
+        model.persrec_tokens.requires_grad_(True)
+    else:
+        raise ValueError("persrec_train_mode requires a model with persrec_tokens.")
+
+    if mode in {"tokens_bias_ln", "tokens_bias_ln_head"}:
+        # 这两种模式等价于“token + bitfit + layernorm”。
+        for name, p in model.named_parameters():
+            if name.endswith(".bias"):
+                p.requires_grad = True
+        for module in model.modules():
+            if isinstance(module, nn.LayerNorm):
+                for p in module.parameters(recurse=False):
+                    p.requires_grad = True
+
+    if mode == "tokens_bias_ln_head":
+        # 再进一步把 projection head 打开，便于 patch / PersRec 共用同一套输出头。
+        if hasattr(model, "proj_linear"):
+            for p in model.proj_linear.parameters():
+                p.requires_grad = True
+        if hasattr(model, "proj_ln"):
+            for p in model.proj_ln.parameters():
+                p.requires_grad = True
+
+    # 这里是“尽力而为”的 LoRA 开关：只有 backbone 真的实现了对应模块才会生效。
+    # 当前 HSTU 没有像 SASRec 那样的 LoRA 模块，所以很多 HSTU 实验实际上不是 LoRA。
+    if bool(getattr(config, "train_input_emb_lora", False)) and hasattr(model, "input_emb_lora"):
+        adapter = getattr(model, "input_emb_lora", None)
+        if adapter is not None:
+            for p in adapter.parameters():
+                p.requires_grad = True
+
+    if bool(getattr(config, "train_attn_lora", False)) and hasattr(model, "blocks"):
+        for block in model.blocks:
+            attn = getattr(block, "attn", None)
+            if attn is None:
+                continue
+            for attr in ("c_attn_lora", "c_proj_lora"):
+                adapter = getattr(attn, attr, None)
+                if adapter is None:
+                    continue
+                for p in adapter.parameters():
+                    p.requires_grad = True
+
+    return mode
 
 
 def save_model_checkpoint(model: nn.Module, config: BaselineConfig) -> Path:
@@ -743,8 +1002,23 @@ def get_gradient_norm(model: nn.Module) -> float:
     return total_norm.item()
 
 
+def get_parameter_grad_norm(parameter: Optional[torch.nn.Parameter]) -> float:
+    if parameter is None or parameter.grad is None:
+        return 0.0
+    return float(torch.norm(parameter.grad.detach(), p=2).item())
+
+
+def get_parameter_delta_norm(
+    parameter: Optional[torch.nn.Parameter],
+    reference: Optional[torch.Tensor],
+) -> float:
+    if parameter is None or reference is None:
+        return 0.0
+    return float(torch.norm(parameter.detach() - reference, p=2).item())
+
+
 def train_persrec(
-    model: SASRec,
+    model: nn.Module,
     train_dataset,
     config: BaselineConfig,
     device: str = "cpu",
@@ -753,6 +1027,8 @@ def train_persrec(
     model = model.to(device)
     truncate_len = resolve_eval_truncate_len(config)
 
+    # PersRec 的训练循环本质上仍然是标准 next-item BCE，
+    # 只是前向里换成了“带 PersRec token 的 backbone”。
     train_sampler = SequentialSampler(train_dataset, config, inject_noise=config.noise_ratio > 0)
     steps_per_epoch = len(train_sampler)
     total_steps = config.num_epochs * steps_per_epoch
@@ -825,6 +1101,10 @@ def train_persrec(
     stop_training = False
     global_step = 0
     pbar = tqdm(total=total_steps)
+    initial_persrec_tokens = None
+    if hasattr(model, "persrec_tokens") and isinstance(getattr(model, "persrec_tokens"), nn.Parameter):
+        # 用初始 token 做参照，方便观察 token 是否真的在学。
+        initial_persrec_tokens = getattr(model, "persrec_tokens").detach().clone()
 
     for epoch in range(config.num_epochs):
         model.train()
@@ -833,6 +1113,8 @@ def train_persrec(
             global_step += 1
             optimizer.zero_grad(set_to_none=True)
 
+            # input_ids / pos_ids / neg_ids:
+            # 常见为 [B, L]；如果 backbone 内部使用多负样本，neg_ids 也可能扩成 [B, L, K]。
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             pos_ids = batch["pos_ids"].to(device, non_blocking=True)
             neg_ids = batch["neg_ids"].to(device, non_blocking=True)
@@ -845,13 +1127,25 @@ def train_persrec(
                 use_patch=False,
                 return_loss_mask=True,
             )
+            # PersRec 下这里拿到的张量长度不是原始 L，而是插入 token 槽位后的 L_total = L + T：
+            # pos_logits: [B, L_total]
+            # neg_logits: [B, L_total] 或 [B, L_total, K]
+            # loss_mask: [B, L_total]
 
             valid_mask = loss_mask
             if valid_mask.any():
                 pos_loss = bce_criterion(pos_logits, torch.ones_like(pos_logits))
                 neg_loss = bce_criterion(neg_logits, torch.zeros_like(neg_logits))
                 raw_loss = pos_loss + neg_loss
+                # PersRec token 槽位已经在 loss_mask 里被清零，这里只在有效 item 位置上做 BCE。
                 loss = raw_loss[valid_mask].mean()
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        f"Non-finite PersRec loss at step {global_step}: "
+                        f"loss={float(loss.detach().item())}, "
+                        f"finite_pos={bool(torch.isfinite(pos_logits).all())}, "
+                        f"finite_neg={bool(torch.isfinite(neg_logits).all())}"
+                    )
                 loss.backward()
             else:
                 loss = pos_logits.sum() * 0.0
@@ -862,30 +1156,45 @@ def train_persrec(
                     config.grad_clip,
                 )
 
+            grad_norm = get_gradient_norm(model)
+            persrec_tokens = getattr(model, "persrec_tokens", None)
+            persrec_token_grad_norm = get_parameter_grad_norm(persrec_tokens)
+            if not math.isfinite(grad_norm):
+                raise FloatingPointError(
+                    f"Non-finite PersRec grad norm at step {global_step}: "
+                    f"grad_norm={grad_norm}, token_grad_norm={persrec_token_grad_norm}"
+                )
+
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             loss_value = float(loss.item())
 
-            grad_norm = get_gradient_norm(model)
+            # TokGrad / TokDelta 是专门给 PersRec 看的诊断量：
+            # 前者看 token 当前有没有梯度，后者看 token 累积偏离初始化多少。
+            persrec_token_delta_norm = get_parameter_delta_norm(persrec_tokens, initial_persrec_tokens)
             current_lr = optimizer.param_groups[0]["lr"]
             pbar.update(1)
 
             if global_step == 1 or global_step % config.steps_per_train_log == 0:
                 logger.info(
-                    "Step %06d | Epoch %03d/%03d | Loss: %.4f | LR: %.2e | Grad: %.2f",
+                    "Step %06d | Epoch %03d/%03d | Loss: %.4f | LR: %.2e | Grad: %.2f | TokGrad: %.4f | TokDelta: %.4f",
                     global_step,
                     epoch + 1,
                     config.num_epochs,
                     loss_value,
                     current_lr,
                     grad_norm,
+                    persrec_token_grad_norm,
+                    persrec_token_delta_norm,
                 )
                 wandb.log(
                     {
                         "train/loss": loss_value,
                         "train/learning_rate": current_lr,
                         "train/grad_norm": grad_norm,
+                        "train/persrec_token_grad_norm": persrec_token_grad_norm,
+                        "train/persrec_token_delta_norm": persrec_token_delta_norm,
                         "progress/epoch": epoch + 1,
                         "progress/step": global_step,
                     }
@@ -973,7 +1282,15 @@ def train_persrec(
 
 
 def run_persrec_experiment(config: BaselineConfig, inferred_state: Optional[Dict[str, torch.Tensor]]) -> None:
+    run = wandb.init(project=f"persrec-{config.dataset}", config=config.__dict__)
+    if run is not None:
+        config = apply_overrides_from_dict(config, dict(run.config))
+
+    config.persrec_train_mode = normalize_persrec_train_mode(config.persrec_train_mode)
+    resolve_dataset_config(config)
+    resolve_eval_protocol_config(config)
     resolve_persrec_config(config)
+    set_global_seed(config.seed, config.deterministic)
 
     device_manager = DeviceManager(logger, preferred_device=config.device, gpu_id=None)
     device = device_manager.device
@@ -987,7 +1304,27 @@ def run_persrec_experiment(config: BaselineConfig, inferred_state: Optional[Dict
         f"{config.dataset}-L{config.num_blocks}-H{config.hidden_units}-"
         f"long{config.max_seq_length}-short{config.eval_seq_length}{persrec_suffix}"
     )
-    run = wandb.init(project=f"persrec-{config.dataset}", name=run_name, config=config.__dict__)
+    if config.backbone == "sasrec" and str(getattr(config, "sasrec_attention_norm", "softmax")).lower() == "softmax1":
+        run_name += "-sm1"
+    if normalize_eval_protocol(getattr(config, "eval_protocol", "legacy_loo")) != "legacy_loo":
+        run_name += f"-anchork{int(getattr(config, 'last_k_eval_test', 0) or 0)}"
+    if config.persrec_train_mode != "full":
+        run_name += f"-{persrec_train_mode_tag(config.persrec_train_mode)}"
+    if int(getattr(config, "input_emb_lora_rank", 0) or 0) > 0:
+        run_name += f"-iel{int(config.input_emb_lora_rank)}"
+    if int(getattr(config, "attn_lora_rank", 0) or 0) > 0:
+        run_name += f"-alr{int(config.attn_lora_rank)}"
+    if run is not None:
+        run.name = run_name
+        run.config.update(
+            {
+                **config.__dict__,
+                "checkpoint_dir": str(config.checkpoint_dir),
+                "data_dir": str(config.data_dir) if config.data_dir is not None else None,
+                "data_txt_path": str(config.data_txt_path) if config.data_txt_path is not None else None,
+            },
+            allow_val_change=True,
+        )
     config.log_config()
 
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -1007,8 +1344,8 @@ def run_persrec_experiment(config: BaselineConfig, inferred_state: Optional[Dict
 
     model = model.to(device)
     initialize_head_as_identity(model)
-    for p in model.parameters():
-        p.requires_grad = True
+    train_mode = configure_persrec_trainable_params(model, config)
+    logger.info(f"PersRec train mode: {train_mode}")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1018,6 +1355,8 @@ def run_persrec_experiment(config: BaselineConfig, inferred_state: Optional[Dict
     logger.info("Running pre-train baseline on val (persrec)...")
     val_eval_dataset = meta_valid_dataset if meta_valid_dataset is not None else train_dataset
     truncate_len = resolve_eval_truncate_len(config)
+    # 这里先测一遍“插入 PersRec token 但还没训练”的 baseline，
+    # 便于和后续真正训练后的效果分开比较。
     val_baseline = evaluate(
         model,
         val_eval_dataset,
@@ -1075,18 +1414,37 @@ def run_persrec_experiment(config: BaselineConfig, inferred_state: Optional[Dict
         }
     )
 
+    if int(getattr(config, "streaming_eval_last_k", 0) or 0) > 1:
+        stream_last_k = int(config.streaming_eval_last_k)
+        logger.info(
+            "Running additional streaming test evaluation over the last %s targets (persrec)...",
+            stream_last_k,
+        )
+        streaming_metrics = evaluate(
+            model,
+            test_dataset,
+            config=config,
+            mode="test",
+            device=device,
+            use_head=config.enable_projection_head,
+            truncate_len=truncate_len,
+            streaming_last_k=stream_last_k,
+        )
+        wandb.log(flatten_streaming_eval_metrics("test_stream/persrec", streaming_metrics))
+
     wandb.finish()
     logger.info("PersRec training complete!")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train PersRec-style SASRec baseline.")
+    parser = argparse.ArgumentParser(description="Train PersRec-style backbone baseline.")
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--data_dir", type=none_or_str, default=None)
     parser.add_argument("--checkpoint_dir", type=none_or_str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--deterministic", type=str2bool, default=None)
+    parser.add_argument("--backbone", type=none_or_str, default=None)
 
     parser.add_argument("--max_seq_length", type=none_or_int, default=None)
     parser.add_argument("--hidden_units", type=int, default=None)
@@ -1094,15 +1452,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_heads", type=int, default=None)
     parser.add_argument("--dropout_rate", type=float, default=None)
     parser.add_argument("--right_align_positions", type=str2bool, default=None)
+    parser.add_argument("--sasrec_attention_norm", type=none_or_str, default=None)
     parser.add_argument("--use_flash_attention", type=str2bool, default=None)
     parser.add_argument("--use_gradient_checkpointing", type=str2bool, default=None)
+    parser.add_argument("--hstu_linear_dim", type=int, default=None)
+    parser.add_argument("--hstu_attention_dim", type=int, default=None)
+    parser.add_argument("--hstu_linear_activation", type=none_or_str, default=None)
+    parser.add_argument("--hstu_attn_dropout", type=float, default=None)
+    parser.add_argument("--hstu_enable_relative_attention_bias", type=str2bool, default=None)
+    parser.add_argument("--hstu_normalization", type=none_or_str, default=None)
+    parser.add_argument("--hstu_concat_ua", type=str2bool, default=None)
+    parser.add_argument("--hstu_epsilon", type=float, default=None)
+    parser.add_argument("--input_emb_lora_rank", type=int, default=None)
+    parser.add_argument("--input_emb_lora_alpha", type=float, default=None)
+    parser.add_argument("--train_input_emb_lora", type=str2bool, default=None)
+    parser.add_argument("--attn_lora_rank", type=int, default=None)
+    parser.add_argument("--attn_lora_alpha", type=float, default=None)
+    parser.add_argument("--attn_lora_blocks", type=none_or_str, default=None)
+    parser.add_argument("--train_attn_lora", type=str2bool, default=None)
 
     parser.add_argument("--persrec_enable", type=str2bool, default=None)
     parser.add_argument("--persrec_num_tokens", type=int, default=None)
     parser.add_argument("--persrec_pretrain_len", type=none_or_int, default=None)
     parser.add_argument("--persrec_recent_len", type=none_or_int, default=None)
     parser.add_argument("--persrec_eval_use_full_seq", type=str2bool, default=None)
+    parser.add_argument("--persrec_train_mode", type=none_or_str, default=None)
     parser.add_argument("--eval_seq_length", type=int, default=None)
+    parser.add_argument("--eval_protocol", type=none_or_str, default=None)
+    parser.add_argument("--last_k_eval_test", type=int, default=None)
+    parser.add_argument("--streaming_eval_last_k", type=int, default=None)
     parser.add_argument("--token_sweep", type=none_or_str, default=None)
 
     parser.add_argument("--batch_size", type=int, default=None)
@@ -1122,7 +1500,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--drop_unseen_items", type=str2bool, default=None)
     parser.add_argument("--strict_load_pretrained", type=str2bool, default=None)
     parser.add_argument("--ckpt_prefix_to_strip", type=none_or_str, default=None)
-    parser.add_argument("--pretrained_ckpt_path", type=none_or_str, default=None)
+    parser.add_argument(
+        "--pretrained_ckpt_path",
+        type=none_or_str,
+        default=None,
+        action=_StoreProvided,
+    )
     parser.add_argument("--infer_ckpt_config", type=str2bool, default=None)
     parser.add_argument("--preserve_max_seq_length", type=str2bool, default=None)
     parser.add_argument("--save_best", type=str2bool, default=None)
@@ -1136,20 +1519,41 @@ def apply_cli_overrides(config: BaselineConfig, args: argparse.Namespace) -> Bas
         "device": "device",
         "seed": "seed",
         "deterministic": "deterministic",
+        "backbone": "backbone",
         "max_seq_length": "max_seq_length",
         "hidden_units": "hidden_units",
         "num_blocks": "num_blocks",
         "num_heads": "num_heads",
         "dropout_rate": "dropout_rate",
         "right_align_positions": "right_align_positions",
+        "sasrec_attention_norm": "sasrec_attention_norm",
         "use_flash_attention": "use_flash_attention",
         "use_gradient_checkpointing": "use_gradient_checkpointing",
+        "hstu_linear_dim": "hstu_linear_dim",
+        "hstu_attention_dim": "hstu_attention_dim",
+        "hstu_linear_activation": "hstu_linear_activation",
+        "hstu_attn_dropout": "hstu_attn_dropout",
+        "hstu_enable_relative_attention_bias": "hstu_enable_relative_attention_bias",
+        "hstu_normalization": "hstu_normalization",
+        "hstu_concat_ua": "hstu_concat_ua",
+        "hstu_epsilon": "hstu_epsilon",
+        "input_emb_lora_rank": "input_emb_lora_rank",
+        "input_emb_lora_alpha": "input_emb_lora_alpha",
+        "train_input_emb_lora": "train_input_emb_lora",
+        "attn_lora_rank": "attn_lora_rank",
+        "attn_lora_alpha": "attn_lora_alpha",
+        "attn_lora_blocks": "attn_lora_blocks",
+        "train_attn_lora": "train_attn_lora",
         "persrec_enable": "persrec_enable",
         "persrec_num_tokens": "persrec_num_tokens",
         "persrec_pretrain_len": "persrec_pretrain_len",
         "persrec_recent_len": "persrec_recent_len",
         "persrec_eval_use_full_seq": "persrec_eval_use_full_seq",
+        "persrec_train_mode": "persrec_train_mode",
         "eval_seq_length": "eval_seq_length",
+        "eval_protocol": "eval_protocol",
+        "last_k_eval_test": "last_k_eval_test",
+        "streaming_eval_last_k": "streaming_eval_last_k",
         "batch_size": "batch_size",
         "num_epochs": "num_epochs",
         "max_learning_rate": "max_learning_rate",
@@ -1177,10 +1581,91 @@ def apply_cli_overrides(config: BaselineConfig, args: argparse.Namespace) -> Bas
         if value is not None:
             setattr(config, attr_name, value)
 
+    # `--pretrained_ckpt_path none` should explicitly clear the preset default.
+    if getattr(args, "_pretrained_ckpt_path_provided", False):
+        config.pretrained_ckpt_path = getattr(args, "pretrained_ckpt_path", None)
+
     if args.data_dir is not None:
         config.data_dir = Path(args.data_dir)
     if args.checkpoint_dir is not None:
         config.checkpoint_dir = Path(args.checkpoint_dir)
+    return config
+
+
+def apply_overrides_from_dict(config: BaselineConfig, values: Mapping[str, Any]) -> BaselineConfig:
+    mapping = {
+        "dataset": "dataset",
+        "device": "device",
+        "seed": "seed",
+        "deterministic": "deterministic",
+        "backbone": "backbone",
+        "max_seq_length": "max_seq_length",
+        "hidden_units": "hidden_units",
+        "num_blocks": "num_blocks",
+        "num_heads": "num_heads",
+        "dropout_rate": "dropout_rate",
+        "right_align_positions": "right_align_positions",
+        "sasrec_attention_norm": "sasrec_attention_norm",
+        "use_flash_attention": "use_flash_attention",
+        "use_gradient_checkpointing": "use_gradient_checkpointing",
+        "hstu_linear_dim": "hstu_linear_dim",
+        "hstu_attention_dim": "hstu_attention_dim",
+        "hstu_linear_activation": "hstu_linear_activation",
+        "hstu_attn_dropout": "hstu_attn_dropout",
+        "hstu_enable_relative_attention_bias": "hstu_enable_relative_attention_bias",
+        "hstu_normalization": "hstu_normalization",
+        "hstu_concat_ua": "hstu_concat_ua",
+        "hstu_epsilon": "hstu_epsilon",
+        "input_emb_lora_rank": "input_emb_lora_rank",
+        "input_emb_lora_alpha": "input_emb_lora_alpha",
+        "train_input_emb_lora": "train_input_emb_lora",
+        "attn_lora_rank": "attn_lora_rank",
+        "attn_lora_alpha": "attn_lora_alpha",
+        "attn_lora_blocks": "attn_lora_blocks",
+        "train_attn_lora": "train_attn_lora",
+        "persrec_enable": "persrec_enable",
+        "persrec_num_tokens": "persrec_num_tokens",
+        "persrec_pretrain_len": "persrec_pretrain_len",
+        "persrec_recent_len": "persrec_recent_len",
+        "persrec_eval_use_full_seq": "persrec_eval_use_full_seq",
+        "persrec_train_mode": "persrec_train_mode",
+        "eval_seq_length": "eval_seq_length",
+        "eval_protocol": "eval_protocol",
+        "last_k_eval_test": "last_k_eval_test",
+        "streaming_eval_last_k": "streaming_eval_last_k",
+        "batch_size": "batch_size",
+        "num_epochs": "num_epochs",
+        "max_learning_rate": "max_learning_rate",
+        "min_learning_rate": "min_learning_rate",
+        "scheduler_type": "scheduler_type",
+        "warmup_steps": "warmup_steps",
+        "warmup_start_lr": "warmup_start_lr",
+        "weight_decay": "weight_decay",
+        "grad_clip": "grad_clip",
+        "steps_per_train_log": "steps_per_train_log",
+        "steps_per_val_log": "steps_per_val_log",
+        "eval_sample_size": "eval_sample_size",
+        "early_stop_patience": "early_stop_patience",
+        "drop_unseen_items": "drop_unseen_items",
+        "strict_load_pretrained": "strict_load_pretrained",
+        "ckpt_prefix_to_strip": "ckpt_prefix_to_strip",
+        "pretrained_ckpt_path": "pretrained_ckpt_path",
+        "infer_ckpt_config": "infer_ckpt_config",
+        "preserve_max_seq_length": "preserve_max_seq_length",
+        "save_best": "save_best",
+        "save_item_embeddings": "save_item_embeddings",
+    }
+    for key, attr in mapping.items():
+        value = values.get(key)
+        if value is not None:
+            setattr(config, attr, value)
+
+    data_dir = values.get("data_dir")
+    if data_dir is not None:
+        config.data_dir = Path(data_dir)
+    checkpoint_dir = values.get("checkpoint_dir")
+    if checkpoint_dir is not None:
+        config.checkpoint_dir = Path(checkpoint_dir)
     return config
 
 
@@ -1200,6 +1685,7 @@ if __name__ == "__main__":
     base_config.persrec_pretrain_len = None
     base_config.persrec_recent_len = None
     base_config.persrec_eval_use_full_seq = True
+    base_config.persrec_train_mode = "full"
     base_config.batch_size = 512
     base_config.num_epochs = 50
     base_config.max_learning_rate = 5e-5
@@ -1217,18 +1703,23 @@ if __name__ == "__main__":
     base_config = apply_cli_overrides(base_config, args)
 
     resolve_dataset_config(base_config)
+    resolve_eval_protocol_config(base_config)
     set_global_seed(base_config.seed, base_config.deterministic)
     desired_max_seq_length = base_config.max_seq_length
 
     inferred_state = None
     if base_config.pretrained_ckpt_path and Path(base_config.pretrained_ckpt_path).exists():
         ckpt = load_checkpoint(base_config.pretrained_ckpt_path, trust_pickle=True)
+        if base_config.infer_ckpt_config:
+            base_config = apply_config_from_checkpoint_payload(base_config, ckpt)
         inferred_state = _strip_module_prefix(_extract_state_dict(ckpt))
         inferred_state = _maybe_strip_prefix(inferred_state, base_config.ckpt_prefix_to_strip)
         if base_config.infer_ckpt_config:
             base_config = infer_config_from_state_dict(inferred_state, base_config)
+            base_config = apply_cli_overrides(base_config, args)
             if base_config.preserve_max_seq_length and desired_max_seq_length is not None:
                 base_config.max_seq_length = desired_max_seq_length
+            resolve_eval_protocol_config(base_config)
     else:
         logger.warning("Pretrained checkpoint not found; proceeding without inference.")
 

@@ -7,6 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-/u/lshi8/miniconda3/envs/py313/bin/python}"
 required_files=(
   "$ROOT/run_sasrec_taobao_standard.py"
   "$ROOT/run_hstu_taobao_standard.py"
+  "$ROOT/run_lru_taobao_standard.py"
   "$ROOT/train_backbone_standard.py"
   "$ROOT/core/loo_dataset.py"
   "$ROOT/core/streaming_eval.py"
@@ -16,6 +17,8 @@ required_files=(
   "$ROOT/backbones/HSTUResearchAligned.py"
   "$ROOT/backbones/modules.py"
   "$ROOT/backbones/patch.py"
+  "$ROOT/id_patch/train_patch_first_order.py"
+  "$ROOT/id_patch/train_Persrec.py"
 )
 
 required_dirs=(
