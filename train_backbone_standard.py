@@ -5,11 +5,12 @@ import inspect
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 
 import wandb
@@ -22,6 +23,10 @@ from backbones.LinRec import LinRec
 from backbones.LRU import LRU
 from backbones.Bert4rec import Bert4Rec
 from backbones.GRU4Rec import GRU4Rec
+from backbones.HSTU import HSTU
+from backbones.HSTUOfficialish import HSTUOfficialish
+from backbones.HSTUResearchAligned import HSTUResearchAligned
+from backbones.LONGER import LONGER
 from backbones.SASRec import SASRec as SASRecBackbone
 
 logger = setup_logger("train-backbone-standard", log_to_file=True)
@@ -31,13 +36,13 @@ logger = setup_logger("train-backbone-standard", log_to_file=True)
 class SASRecConfig:
     """Configuration for backbone training (LOO datasets)."""
 
-    dataset: str = "ml10m_loo202"
+    dataset: str = "taobao_loo202"
     data_dir: Optional[Path] = None
     data_txt_path: Optional[Path] = None
     checkpoint_dir: Path = Path("/home/lingfengs111/codes/soft_patch_training/checkpoints")
 
     # Model (shared)
-    backbone: str = "linrec"  # sasrec | fmlp | linrec | bert4rec | gru4rec | lru
+    backbone: str = "hstu"  # sasrec | hstu | longer | fmlp | linrec | bert4rec | gru4rec | lru
     max_seq_length: Optional[int] = None
     hidden_units: int = 128
     num_blocks: int = 2
@@ -45,10 +50,29 @@ class SASRecConfig:
     dropout_rate: float = 0.1
     right_align_positions: bool = True
     initializer_range: float = 0.02
+    shared_prefix_len: int = 0
+    shared_prefix_init_std: float = 0.02
 
     # SASRec-specific
     use_flash_attention: Optional[bool] = True
+    sasrec_attention_norm: str = "softmax"
+    sasrec_enable_relative_attention_bias: bool = False
     use_gradient_checkpointing: bool = False
+
+    # HSTU-specific
+    hstu_linear_dim: Optional[int] = None
+    hstu_attention_dim: Optional[int] = None
+    hstu_linear_activation: str = "silu"
+    hstu_attn_dropout: Optional[float] = None
+    hstu_enable_relative_attention_bias: bool = False
+    hstu_concat_ua: bool = False
+    hstu_epsilon: float = 1e-6
+
+    # LONGER-specific
+    longer_global_tokens: int = 4
+    longer_merge_size: int = 4
+    longer_merge_pool: str = "last"  # last | mean
+    longer_inner_num_layers: int = 1
 
     # FMLP-specific
     fmlp_num_layers: Optional[int] = 2
@@ -95,9 +119,13 @@ class SASRecConfig:
     head_use_gelu: bool = False
     head_use_ln: bool = True
     head_residual: bool = False
+    user_embedding_norm: str = "none"  # none | l2_norm | layer_norm
+    item_l2_norm: bool = False
+    temperature: float = 1.0
+    l2_norm_eps: float = 1e-6
 
     # Training parameters
-    batch_size: int = 512  # Batch size for training
+    batch_size: int = 1024  # Batch size for training
     num_epochs: int = 200  # Number of training epochs
     max_learning_rate: float = 5e-4  # Maximum learning rate (start of cosine)
     min_learning_rate: float = 5e-6  # Minimum learning rate (end of cosine)
@@ -121,11 +149,29 @@ class SASRecConfig:
     run_tag: Optional[str] = None
 
     # Device settings
-    device: str = "cuda:2"  # e.g., "cuda:1", "cpu", "mps"
+    device: str = "cuda:1"  # e.g., "cuda:1", "cpu", "mps"
 
     def __post_init__(self):
         if self.use_flash_attention is None:
             self.use_flash_attention = True
+        self.sasrec_attention_norm = str(self.sasrec_attention_norm or "softmax").strip().lower()
+        if self.sasrec_attention_norm not in {"softmax", "softmax_custom", "softmax1"}:
+            raise ValueError(f"Unsupported sasrec_attention_norm: {self.sasrec_attention_norm}")
+        if self.hstu_linear_dim is None:
+            self.hstu_linear_dim = max(1, self.hidden_units // max(self.num_heads, 1))
+        if self.hstu_attention_dim is None:
+            self.hstu_attention_dim = max(1, self.hidden_units // max(self.num_heads, 1))
+        if self.hstu_attn_dropout is None:
+            self.hstu_attn_dropout = self.dropout_rate
+        self.longer_merge_pool = str(self.longer_merge_pool).lower()
+        if self.longer_merge_pool not in {"last", "mean"}:
+            raise ValueError(f"Unsupported longer_merge_pool: {self.longer_merge_pool}")
+        if int(self.longer_merge_size) <= 0:
+            raise ValueError("longer_merge_size must be > 0.")
+        if int(self.longer_global_tokens) < 0:
+            raise ValueError("longer_global_tokens must be >= 0.")
+        if int(self.longer_inner_num_layers) <= 0:
+            raise ValueError("longer_inner_num_layers must be > 0.")
 
         if self.fmlp_num_layers is None:
             self.fmlp_num_layers = self.num_blocks
@@ -193,12 +239,39 @@ class SASRecConfig:
         logger.info(f"  dropout_rate: {self.dropout_rate}")
         logger.info(f"  right_align_positions: {self.right_align_positions}")
         logger.info(f"  initializer_range: {self.initializer_range}")
+        logger.info(f"  shared_prefix_len: {self.shared_prefix_len}")
+        logger.info(f"  shared_prefix_init_std: {self.shared_prefix_init_std}")
 
         # Backbone-specific parameters
         backbone = self.backbone.lower()
         if backbone == "sasrec":
             logger.info("SASRec Parameters:")
             logger.info(f"  use_flash_attention: {self.use_flash_attention}")
+            logger.info(f"  sasrec_attention_norm: {self.sasrec_attention_norm}")
+            logger.info(f"  sasrec_enable_relative_attention_bias: {self.sasrec_enable_relative_attention_bias}")
+        elif backbone in {
+            "hstu",
+            "hstu_officialish",
+            "hstu_official",
+            "hstu_orig",
+            "hstu_research_aligned",
+            "hstu_research",
+            "hstu_ra",
+        }:
+            logger.info("HSTU Parameters:")
+            logger.info(f"  hstu_linear_dim: {self.hstu_linear_dim}")
+            logger.info(f"  hstu_attention_dim: {self.hstu_attention_dim}")
+            logger.info(f"  hstu_linear_activation: {self.hstu_linear_activation}")
+            logger.info(f"  hstu_attn_dropout: {self.hstu_attn_dropout}")
+            logger.info(f"  hstu_enable_relative_attention_bias: {self.hstu_enable_relative_attention_bias}")
+            logger.info(f"  hstu_concat_ua: {self.hstu_concat_ua}")
+            logger.info(f"  hstu_epsilon: {self.hstu_epsilon}")
+        elif backbone == "longer":
+            logger.info("LONGER Parameters:")
+            logger.info(f"  longer_global_tokens: {self.longer_global_tokens}")
+            logger.info(f"  longer_merge_size: {self.longer_merge_size}")
+            logger.info(f"  longer_merge_pool: {self.longer_merge_pool}")
+            logger.info(f"  longer_inner_num_layers: {self.longer_inner_num_layers}")
         elif backbone == "fmlp":
             logger.info("FMLP Parameters:")
             logger.info(f"  fmlp_num_layers: {self.fmlp_num_layers}")
@@ -240,6 +313,10 @@ class SASRecConfig:
         logger.info(f"  head_use_gelu: {self.head_use_gelu}")
         logger.info(f"  head_use_ln: {self.head_use_ln}")
         logger.info(f"  head_residual: {self.head_residual}")
+        logger.info(f"  user_embedding_norm: {self.user_embedding_norm}")
+        logger.info(f"  item_l2_norm: {self.item_l2_norm}")
+        logger.info(f"  temperature: {self.temperature}")
+        logger.info(f"  l2_norm_eps: {self.l2_norm_eps}")
 
         # Training parameters
         logger.info("Training Parameters:")
@@ -270,6 +347,9 @@ class SASRecConfig:
     def apply_backbone_overrides(self) -> None:
         """Apply backbone-specific tuning overrides."""
         backbone = self.backbone.lower()
+        self.sasrec_attention_norm = str(self.sasrec_attention_norm or "softmax").strip().lower()
+        if self.sasrec_attention_norm not in {"softmax", "softmax_custom", "softmax1"}:
+            raise ValueError(f"Unsupported sasrec_attention_norm: {self.sasrec_attention_norm}")
         if backbone == "linrec":
             if self.linrec_max_learning_rate is not None:
                 self.max_learning_rate = float(self.linrec_max_learning_rate)
@@ -330,7 +410,6 @@ class SequentialSampler:
     def __iter__(self):
         # Shuffle at the beginning of each epoch
         indices = np.random.permutation(len(self.valid_user_seqs))
-
         for i in range(0, len(indices), self.batch_size):
             batch_indices = indices[i : i + self.batch_size]
             batch_data = [self.valid_user_seqs[idx] for idx in batch_indices]
@@ -469,7 +548,10 @@ def evaluate(
                 candidates_list.append(torch.tensor(candidates, device=device))
             candidates_tensor = torch.stack(candidates_list, dim=0)
 
-            scores = model.predict(valid_input, candidates_tensor)
+            if _uses_similarity_scoring(config):
+                scores = _predict_with_similarity(model, valid_input, candidates_tensor, config)
+            else:
+                scores = model.predict(valid_input, candidates_tensor)
 
         _, indices = torch.sort(scores, dim=1, descending=True)
         ranks = (indices == 0).nonzero(as_tuple=True)[1].cpu().numpy() + 1  # 1-indexed ranks
@@ -493,6 +575,14 @@ def build_backbone(config: SASRecConfig, item_num: int) -> nn.Module:
     backbone_name = config.backbone.lower()
     if backbone_name == "sasrec":
         return SASRecBackbone(config, item_num=item_num)
+    if backbone_name == "hstu":
+        return HSTU(config, item_num=item_num)
+    if backbone_name in {"hstu_officialish", "hstu_official", "hstu_orig"}:
+        return HSTUOfficialish(config, item_num=item_num)
+    if backbone_name in {"hstu_research_aligned", "hstu_research", "hstu_ra"}:
+        return HSTUResearchAligned(config, item_num=item_num)
+    if backbone_name == "longer":
+        return LONGER(config, item_num=item_num)
     if backbone_name == "fmlp":
         return FMLP(config, item_num=item_num)
     if backbone_name == "linrec":
@@ -504,7 +594,7 @@ def build_backbone(config: SASRecConfig, item_num: int) -> nn.Module:
     if backbone_name == "lru":
         return LRU(config, item_num=item_num)
     raise ValueError(
-        f"Unknown backbone '{config.backbone}'. Expected one of: sasrec, fmlp, linrec, bert4rec, gru4rec, lru."
+        f"Unknown backbone '{config.backbone}'. Expected one of: sasrec, hstu, hstu_officialish, hstu_research_aligned, longer, fmlp, linrec, bert4rec, gru4rec, lru."
     )
 
 
@@ -526,13 +616,158 @@ def _ensure_patch_defaults(config: SASRecConfig) -> None:
             setattr(config, name, value)
 
 
+def _uses_similarity_scoring(config: Optional[SASRecConfig]) -> bool:
+    if config is None:
+        return False
+    norm = str(getattr(config, "user_embedding_norm", "none") or "none").lower()
+    item_l2 = bool(getattr(config, "item_l2_norm", False))
+    temperature = float(getattr(config, "temperature", 1.0) or 1.0)
+    return norm != "none" or item_l2 or abs(temperature - 1.0) > 1e-12
+
+
+def _resolve_item_embedding(model: nn.Module) -> nn.Module:
+    if hasattr(model, "item_emb"):
+        return model.item_emb
+    if hasattr(model, "embedding") and hasattr(model.embedding, "token"):
+        return model.embedding.token
+    raise AttributeError("Unable to locate item embedding on model (expected item_emb or embedding.token).")
+
+
+def _strip_hidden_states_for_scoring(model: nn.Module, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    _ = input_ids
+    if hasattr(model, "_strip_patch_tokens"):
+        try:
+            hidden_states = model._strip_patch_tokens(hidden_states)
+        except TypeError:
+            patch_len = int(getattr(model, "patch_len", 0) or 0)
+            if patch_len > 0:
+                hidden_states = hidden_states[:, patch_len:, :]
+    if hasattr(model, "strip_patch_tokens"):
+        try:
+            hidden_states = model.strip_patch_tokens(hidden_states)
+        except TypeError:
+            patch_len = int(getattr(model, "patch_len", 0) or 0)
+            if patch_len > 0:
+                hidden_states = hidden_states[:, patch_len:, :]
+    if hasattr(model, "_strip_shared_tokens"):
+        hidden_states = model._strip_shared_tokens(hidden_states)
+    return hidden_states
+
+
+def _normalize_user_embeddings(
+    projected: torch.Tensor,
+    config: SASRecConfig,
+    model: Optional[nn.Module] = None,
+) -> torch.Tensor:
+    if model is not None and hasattr(model, "postprocess_query_embeddings"):
+        return model.postprocess_query_embeddings(projected)
+    norm = str(getattr(config, "user_embedding_norm", "none") or "none").lower()
+    eps = float(getattr(config, "l2_norm_eps", 1e-6) or 1e-6)
+    if norm == "none":
+        return projected
+    if norm == "l2_norm":
+        return F.normalize(projected, p=2, dim=-1, eps=eps)
+    if norm == "layer_norm":
+        return F.layer_norm(projected, normalized_shape=(projected.size(-1),), eps=eps)
+    raise ValueError(f"Unsupported user_embedding_norm: {norm}")
+
+
+def _normalize_item_embeddings(
+    item_embeddings: torch.Tensor,
+    config: SASRecConfig,
+    model: Optional[nn.Module] = None,
+) -> torch.Tensor:
+    if model is not None and hasattr(model, "postprocess_item_embeddings"):
+        return model.postprocess_item_embeddings(item_embeddings)
+    if not bool(getattr(config, "item_l2_norm", False)):
+        return item_embeddings
+    eps = float(getattr(config, "l2_norm_eps", 1e-6) or 1e-6)
+    return F.normalize(item_embeddings, p=2, dim=-1, eps=eps)
+
+
+def _apply_similarity_logits(
+    projected: torch.Tensor,
+    item_embeddings: torch.Tensor,
+    config: SASRecConfig,
+    model: Optional[nn.Module] = None,
+) -> torch.Tensor:
+    projected = _normalize_user_embeddings(projected, config, model=model)
+    item_embeddings = _normalize_item_embeddings(item_embeddings.to(projected.dtype), config, model=model)
+    if item_embeddings.dim() == projected.dim():
+        logits = (projected * item_embeddings).sum(dim=-1)
+    elif item_embeddings.dim() == projected.dim() + 1:
+        logits = (projected.unsqueeze(-2) * item_embeddings).sum(dim=-1)
+    elif projected.dim() == 2 and item_embeddings.dim() == 3:
+        logits = torch.einsum("bd,bnd->bn", projected, item_embeddings)
+    else:
+        raise ValueError(
+            f"Unsupported shapes for similarity logits: projected={tuple(projected.shape)}, "
+            f"item_embeddings={tuple(item_embeddings.shape)}"
+        )
+    temperature = float(getattr(config, "temperature", 1.0) or 1.0)
+    if temperature != 1.0:
+        logits = logits / temperature
+    return logits
+
+
+def _training_logits_with_similarity(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    pos_ids: torch.Tensor,
+    neg_ids: torch.Tensor,
+    config: SASRecConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    hidden_states = model.forward_features(input_ids)
+    hidden_states = _strip_hidden_states_for_scoring(model, hidden_states, input_ids)
+    projected = model.apply_head(hidden_states)
+    item_emb = _resolve_item_embedding(model)
+    pos_embs = item_emb(pos_ids).to(projected.dtype)
+    neg_embs = item_emb(neg_ids).to(projected.dtype)
+    pos_logits = _apply_similarity_logits(projected, pos_embs, config, model=model)
+    neg_logits = _apply_similarity_logits(projected, neg_embs, config, model=model)
+    return pos_logits, neg_logits
+
+
+def _predict_with_similarity(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    config: SASRecConfig,
+) -> torch.Tensor:
+    hidden_states = model.forward_features(input_ids)
+    hidden_states = _strip_hidden_states_for_scoring(model, hidden_states, input_ids)
+    final_hidden = model.apply_head(hidden_states[:, -1, :])
+    candidate_embs = _resolve_item_embedding(model)(candidate_ids).to(final_hidden.dtype)
+    return _apply_similarity_logits(final_hidden, candidate_embs, config, model=model)
+
+
 def build_checkpoint_tag(config: SASRecConfig) -> str:
     backbone_name = config.backbone.lower()
     num_blocks = config.lru_num_blocks if backbone_name == "lru" else config.num_blocks
-    return (
+    tag = (
         f"{backbone_name}_{config.dataset}_seq{config.max_seq_length}_dim{config.hidden_units}"
         f"_L{num_blocks}_H{config.num_heads}"
     )
+    if int(getattr(config, "shared_prefix_len", 0) or 0) > 0:
+        tag += f"_SP{int(config.shared_prefix_len)}"
+    if backbone_name == "sasrec" and str(getattr(config, "sasrec_attention_norm", "softmax")).lower() == "softmax1":
+        tag += "_SM1"
+    elif backbone_name == "sasrec" and str(getattr(config, "sasrec_attention_norm", "softmax")).lower() == "softmax_custom":
+        tag += "_SMCUSTOM"
+    if backbone_name == "sasrec" and bool(getattr(config, "sasrec_enable_relative_attention_bias", False)):
+        tag += "_RB"
+    if _uses_similarity_scoring(config):
+        norm = str(getattr(config, "user_embedding_norm", "none") or "none").lower()
+        if norm == "l2_norm":
+            tag += "_UQ"
+        elif norm == "layer_norm":
+            tag += "_ULN"
+        if bool(getattr(config, "item_l2_norm", False)):
+            tag += "_IQ"
+        temperature = float(getattr(config, "temperature", 1.0) or 1.0)
+        if abs(temperature - 1.0) > 1e-12:
+            tag += f"_T{str(temperature).replace('.', 'p')}"
+    return tag
 
 
 def save_model_checkpoint(model: nn.Module, config: SASRecConfig) -> Path:
@@ -696,7 +931,10 @@ def train_sasrec(
             neg_ids = batch["neg_ids"].to(device, non_blocking=True)
 
             # Forward pass
-            pos_logits, neg_logits = model.training_step(input_ids, pos_ids, neg_ids)
+            if _uses_similarity_scoring(config):
+                pos_logits, neg_logits = _training_logits_with_similarity(model, input_ids, pos_ids, neg_ids, config)
+            else:
+                pos_logits, neg_logits = model.training_step(input_ids, pos_ids, neg_ids)
 
             valid_mask = pos_ids != 0
 
@@ -850,6 +1088,25 @@ if __name__ == "__main__":
         f"{config.backbone}-{config.dataset}-{run_blocks}b-{config.num_heads}h-"
         f"{config.hidden_units}-{config.max_seq_length}_{es_suffix}-standard"
     )
+    if int(getattr(config, "shared_prefix_len", 0) or 0) > 0:
+        run_name += f"-sp{int(config.shared_prefix_len)}"
+    if config.backbone == "sasrec" and str(getattr(config, "sasrec_attention_norm", "softmax")).lower() == "softmax1":
+        run_name += "-sm1"
+    elif config.backbone == "sasrec" and str(getattr(config, "sasrec_attention_norm", "softmax")).lower() == "softmax_custom":
+        run_name += "-smcustom"
+    if config.backbone == "sasrec" and bool(getattr(config, "sasrec_enable_relative_attention_bias", False)):
+        run_name += "-rbias"
+    if _uses_similarity_scoring(config):
+        norm = str(getattr(config, "user_embedding_norm", "none") or "none").lower()
+        if norm == "l2_norm":
+            run_name += "-uq"
+        elif norm == "layer_norm":
+            run_name += "-uln"
+        if bool(getattr(config, "item_l2_norm", False)):
+            run_name += "-iq"
+        temperature = float(getattr(config, "temperature", 1.0) or 1.0)
+        if abs(temperature - 1.0) > 1e-12:
+            run_name += f"-t{str(temperature).replace('.', 'p')}"
     run = wandb.init(project=f"backbone-standard-{config.dataset}", name=run_name, config=config.__dict__)
     base_ckpt_dir = config.checkpoint_dir / f"{config.backbone}_loo_standard"
     if not config.run_tag:

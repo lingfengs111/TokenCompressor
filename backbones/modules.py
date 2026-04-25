@@ -3,6 +3,7 @@
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -31,6 +32,36 @@ def sequence_summary(
     batch_idx = torch.arange(item_embs.size(0), device=item_embs.device)
     last_emb = item_embs[batch_idx, last_idx]
     return last_emb, lengths
+
+
+def shared_token_len_from_config(config) -> int:
+    return int(getattr(config, "shared_prefix_len", 0) or 0)
+
+
+def shared_token_init_std_from_config(config, default: float = 0.02) -> float:
+    return float(getattr(config, "shared_prefix_init_std", default) or default)
+
+
+def expand_shared_token_bank(
+    shared_tokens: Optional[torch.Tensor],
+    batch_size: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    if shared_tokens is None:
+        return None
+    if shared_tokens.dim() == 2:
+        shared_tokens = shared_tokens.unsqueeze(0)
+    return shared_tokens.to(device=device, dtype=dtype).expand(batch_size, -1, -1)
+
+
+def strip_leading_tokens(hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    if num_tokens <= 0:
+        return hidden_states
+    if hidden_states.size(1) <= num_tokens:
+        return hidden_states[:, :0, :]
+    return hidden_states[:, num_tokens:, :]
 
 
 def head_parameters(config, proj_linear, proj_ln) -> List[torch.Tensor]:
@@ -71,3 +102,69 @@ def apply_head(
     if getattr(config, "head_residual", False):
         return hidden_states + delta
     return delta
+
+
+def _expand_batch_values(values: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    while values.dim() < target.dim():
+        values = values.unsqueeze(-1)
+    return values
+
+
+class ScoreCalibrationHead(nn.Module):
+    """Optional scorer-side priors shared across backbones."""
+
+    def __init__(
+        self,
+        num_items: int,
+        max_seq_length: int,
+        *,
+        enable_item_bias: bool = False,
+        enable_length_bias: bool = False,
+        enable_length_scale: bool = False,
+        bucket_size: int = 20,
+    ) -> None:
+        super().__init__()
+        self.bucket_size = max(1, int(bucket_size or 1))
+        max_seq_length = max(1, int(max_seq_length or 1))
+        self.num_buckets = max(1, (max_seq_length + self.bucket_size - 1) // self.bucket_size)
+
+        self.item_bias = nn.Embedding(num_items, 1, padding_idx=0) if enable_item_bias else None
+        self.length_bias = nn.Embedding(self.num_buckets, 1) if enable_length_bias else None
+        self.length_scale_log = nn.Embedding(self.num_buckets, 1) if enable_length_scale else None
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.item_bias is not None:
+            nn.init.zeros_(self.item_bias.weight)
+            if self.item_bias.padding_idx is not None:
+                with torch.no_grad():
+                    self.item_bias.weight[self.item_bias.padding_idx].fill_(0)
+        if self.length_bias is not None:
+            nn.init.zeros_(self.length_bias.weight)
+        if self.length_scale_log is not None:
+            nn.init.zeros_(self.length_scale_log.weight)
+
+    def _bucket_ids(self, seq_lengths: torch.Tensor) -> torch.Tensor:
+        lengths = seq_lengths.to(dtype=torch.long).clamp_min(1)
+        bucket_ids = torch.div(lengths - 1, self.bucket_size, rounding_mode="floor")
+        return bucket_ids.clamp_max(self.num_buckets - 1)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        item_ids: torch.Tensor,
+        seq_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.item_bias is None and self.length_bias is None and self.length_scale_log is None:
+            return logits
+        bucket_ids = self._bucket_ids(seq_lengths)
+        out = logits
+        if self.length_scale_log is not None:
+            scale = torch.exp(self.length_scale_log(bucket_ids).squeeze(-1).clamp(min=-5.0, max=5.0))
+            out = out * _expand_batch_values(scale.to(dtype=out.dtype), out)
+        if self.item_bias is not None:
+            out = out + self.item_bias(item_ids).squeeze(-1).to(dtype=out.dtype)
+        if self.length_bias is not None:
+            bias = self.length_bias(bucket_ids).squeeze(-1).to(dtype=out.dtype)
+            out = out + _expand_batch_values(bias, out)
+        return out

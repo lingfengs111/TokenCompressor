@@ -1,5 +1,6 @@
 """SASRec backbone with meta-patch, projection head, and optional PEFT adapters."""
 
+import math
 import logging
 from typing import List, Optional, Set, Tuple
 
@@ -9,7 +10,16 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 from backbones.patch import MetaPatch
-from backbones.modules import apply_head as apply_head_fn, head_parameters as head_parameters_fn, sequence_summary
+from backbones.modules import (
+    apply_head as apply_head_fn,
+    expand_shared_token_bank,
+    ScoreCalibrationHead,
+    head_parameters as head_parameters_fn,
+    sequence_summary,
+    shared_token_init_std_from_config,
+    shared_token_len_from_config,
+    strip_leading_tokens,
+)
 
 logger = logging.getLogger("train-sasrec-meta-patch")
 
@@ -55,6 +65,167 @@ def _parse_block_selection(spec: str, num_blocks: int) -> Set[int]:
             raise ValueError(f"attn_lora_blocks index out of range: {token}")
         selected.add(idx)
     return selected
+
+
+def _normalize_attention_norm(value: str) -> str:
+    norm = str(value or "softmax").strip().lower()
+    aliases = {
+        "sdpa": "softmax",
+        "sm": "softmax",
+        "custom": "softmax_custom",
+        "manual_softmax": "softmax_custom",
+        "softmax_manual": "softmax_custom",
+        "sm1": "softmax1",
+        "softmax_1": "softmax1",
+        "softmax+1": "softmax1",
+    }
+    norm = aliases.get(norm, norm)
+    if norm not in {"softmax", "softmax_custom", "softmax1"}:
+        raise ValueError(f"Unsupported SASRec attention_norm: {value}")
+    return norm
+
+
+class RelativePositionalBias(nn.Module):
+    """Learned relative-position bias table, matching the HSTU parameterization."""
+
+    def __init__(self, max_seq_len: int) -> None:
+        super().__init__()
+        if max_seq_len <= 0:
+            raise ValueError("RelativePositionalBias requires max_seq_len > 0.")
+        self.max_seq_len = int(max_seq_len)
+        self.bias = nn.Parameter(torch.empty(2 * self.max_seq_len - 1))
+        nn.init.normal_(self.bias, mean=0.0, std=0.02)
+
+    def forward(self, seq_len: int, dtype: torch.dtype) -> torch.Tensor:
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}.")
+        t = F.pad(self.bias[: 2 * seq_len - 1], [0, seq_len]).repeat(seq_len)
+        t = t[..., :-seq_len].reshape(1, seq_len, 3 * seq_len - 2)
+        radius = (2 * seq_len - 1) // 2
+        return t[..., radius:-radius].squeeze(0).to(dtype=dtype)
+
+
+def _custom_softmax_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    extra_bias: Optional[torch.Tensor],
+    is_causal: bool,
+    dropout_p: float,
+    training: bool,
+) -> torch.Tensor:
+    """Scaled dot-product attention with standard softmax using the manual softmax1 path."""
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+    if extra_bias is not None:
+        scores = scores + extra_bias.to(dtype=scores.dtype)
+
+    valid_mask: Optional[torch.Tensor] = None
+    if attn_mask is not None:
+        if attn_mask.dim() == 3:
+            attn_mask = attn_mask.unsqueeze(1)
+        if attn_mask.dtype == torch.bool:
+            valid_mask = attn_mask
+        else:
+            attn_bias = attn_mask.to(dtype=scores.dtype)
+            scores = scores + attn_bias
+            mask_floor = torch.finfo(attn_bias.dtype).min / 2
+            valid_mask = attn_bias > mask_floor
+    elif is_causal:
+        q_len = q.size(-2)
+        kv_len = k.size(-2)
+        q_pos = torch.arange(q_len, device=q.device).unsqueeze(-1)
+        k_pos = torch.arange(kv_len, device=q.device).unsqueeze(0)
+        valid_mask = (k_pos <= q_pos).view(1, 1, q_len, kv_len)
+
+    scores = scores.to(torch.float32)
+    if valid_mask is not None:
+        valid_mask = valid_mask.to(dtype=torch.bool)
+        scores = torch.where(valid_mask, scores, torch.full_like(scores, float("-inf")))
+
+    row_max = scores.max(dim=-1, keepdim=True).values
+    row_max = torch.where(torch.isfinite(row_max), row_max, torch.zeros_like(row_max))
+    exp_scores = torch.exp(scores - row_max)
+    if valid_mask is not None:
+        exp_scores = torch.where(valid_mask, exp_scores, torch.zeros_like(exp_scores))
+    denom = exp_scores.sum(dim=-1, keepdim=True)
+    probs = torch.where(denom > 0, exp_scores / denom.clamp_min(torch.finfo(exp_scores.dtype).tiny), exp_scores)
+    if dropout_p > 0.0:
+        probs = F.dropout(probs, p=dropout_p, training=training)
+    return torch.matmul(probs.to(dtype=v.dtype), v)
+
+
+def _softmax1_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    extra_bias: Optional[torch.Tensor],
+    is_causal: bool,
+    dropout_p: float,
+    training: bool,
+) -> torch.Tensor:
+    """Scaled dot-product attention with softmax1 normalization."""
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+    if extra_bias is not None:
+        scores = scores + extra_bias.to(dtype=scores.dtype)
+
+    valid_mask: Optional[torch.Tensor] = None
+    if attn_mask is not None:
+        if attn_mask.dim() == 3:
+            attn_mask = attn_mask.unsqueeze(1)
+        if attn_mask.dtype == torch.bool:
+            valid_mask = attn_mask
+        else:
+            attn_bias = attn_mask.to(dtype=scores.dtype)
+            scores = scores + attn_bias
+            mask_floor = torch.finfo(attn_bias.dtype).min / 2
+            valid_mask = attn_bias > mask_floor
+    elif is_causal:
+        q_len = q.size(-2)
+        kv_len = k.size(-2)
+        q_pos = torch.arange(q_len, device=q.device).unsqueeze(-1)
+        k_pos = torch.arange(kv_len, device=q.device).unsqueeze(0)
+        valid_mask = (k_pos <= q_pos).view(1, 1, q_len, kv_len)
+
+    scores = scores.to(torch.float32)
+    if valid_mask is not None:
+        valid_mask = valid_mask.to(dtype=torch.bool)
+        scores = torch.where(valid_mask, scores, torch.full_like(scores, float("-inf")))
+
+    row_max = scores.max(dim=-1, keepdim=True).values
+    row_max = torch.where(torch.isfinite(row_max), row_max, torch.zeros_like(row_max))
+    exp_scores = torch.exp(scores - row_max)
+    if valid_mask is not None:
+        exp_scores = torch.where(valid_mask, exp_scores, torch.zeros_like(exp_scores))
+    probs = exp_scores / (1.0 + exp_scores.sum(dim=-1, keepdim=True))
+    if dropout_p > 0.0:
+        probs = F.dropout(probs, p=dropout_p, training=training)
+    return torch.matmul(probs.to(dtype=v.dtype), v)
+
+
+def _apply_rope(q: torch.Tensor, k: torch.Tensor, base: float = 10000.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embeddings to q/k using current sequence slots."""
+    head_dim = q.size(-1)
+    rope_dim = head_dim - (head_dim % 2)
+    if rope_dim <= 0:
+        return q, k
+    positions = torch.arange(q.size(-2), device=q.device, dtype=torch.float32)
+    inv_freq = 1.0 / (float(base) ** (torch.arange(0, rope_dim, 2, device=q.device, dtype=torch.float32) / rope_dim))
+    freqs = torch.outer(positions, inv_freq)
+    cos = freqs.cos().to(dtype=q.dtype).view(1, 1, q.size(-2), rope_dim // 2)
+    sin = freqs.sin().to(dtype=q.dtype).view(1, 1, q.size(-2), rope_dim // 2)
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        x_rope = x[..., :rope_dim]
+        x_even = x_rope[..., 0::2]
+        x_odd = x_rope[..., 1::2]
+        x_rot = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1).flatten(-2)
+        if rope_dim == head_dim:
+            return x_rot
+        return torch.cat([x_rot, x[..., rope_dim:]], dim=-1)
+
+    return rotate(q), rotate(k)
 
 
 class LowRankLinearAdapter(nn.Module):
@@ -104,8 +275,13 @@ class CausalSelfAttention(nn.Module):
         num_heads: int,
         dropout_rate: float,
         use_flash_attention: bool = True,
+        attention_norm: str = "softmax",
         lora_rank: int = 0,
         lora_alpha: float = 1.0,
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
+        enable_relative_attention_bias: bool = False,
+        max_length: Optional[int] = None,
     ):
         super().__init__()
         assert hidden_units % num_heads == 0
@@ -119,7 +295,15 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.hidden_units = hidden_units
         self.use_flash_attention = use_flash_attention
+        self.attention_norm = _normalize_attention_norm(attention_norm)
+        self.use_rope = bool(use_rope)
+        self.rope_base = float(rope_base)
         self._flash_fallback_warned = False
+        self.rel_pos_bias = (
+            RelativePositionalBias(max_length)
+            if enable_relative_attention_bias and max_length is not None
+            else None
+        )
         self.c_attn_lora = (
             LowRankLinearAdapter(hidden_units, 3 * hidden_units, lora_rank, lora_alpha) if lora_rank > 0 else None
         )
@@ -140,6 +324,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()  # (B, nh, T, hs)
         q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()  # (B, nh, T, hs)
         v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()  # (B, nh, T, hs)
+        if self.use_rope:
+            q, k = _apply_rope(q, k, base=self.rope_base)
+        rel_bias = None
+        if self.rel_pos_bias is not None:
+            rel_bias = self.rel_pos_bias(T, dtype=q.dtype).view(1, 1, T, T)
 
         # Causal self-attention (prefer flash when available; disable under forward AD)
         try:
@@ -152,28 +341,62 @@ class CausalSelfAttention(nn.Module):
         use_causal = attn_mask is None
         attn_bias = attn_mask
 
-        if q.is_cuda and self.use_flash_attention and not fwd_ad_enabled and attn_bias is None:
-            try:
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=None, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
+        if self.attention_norm == "softmax_custom":
+            y = _custom_softmax_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_bias,
+                extra_bias=rel_bias,
+                is_causal=use_causal,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                training=self.training,
+            )
+        elif self.attention_norm == "softmax1":
+            y = _softmax1_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_bias,
+                extra_bias=rel_bias,
+                is_causal=use_causal,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                training=self.training,
+            )
+        else:
+            if rel_bias is not None:
+                y = _custom_softmax_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_bias,
+                    extra_bias=rel_bias,
+                    is_causal=use_causal,
+                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    training=self.training,
                 )
-            except RuntimeError:
-                if not self._flash_fallback_warned:
-                    logger.warning("Flash attention failed; falling back to math kernel.")
-                    self._flash_fallback_warned = True
+            elif q.is_cuda and self.use_flash_attention and not fwd_ad_enabled and attn_bias is None:
+                try:
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=None, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
+                    )
+                except RuntimeError:
+                    if not self._flash_fallback_warned:
+                        logger.warning("Flash attention failed; falling back to math kernel.")
+                        self._flash_fallback_warned = True
+                    with _sdpa_kernel_context(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                        y = F.scaled_dot_product_attention(
+                            q, k, v, attn_mask=attn_bias, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
+                        )
+            elif q.is_cuda:
                 with _sdpa_kernel_context(enable_flash=False, enable_mem_efficient=False, enable_math=True):
                     y = F.scaled_dot_product_attention(
                         q, k, v, attn_mask=attn_bias, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
                     )
-        elif q.is_cuda:
-            with _sdpa_kernel_context(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+            else:
                 y = F.scaled_dot_product_attention(
                     q, k, v, attn_mask=attn_bias, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
                 )
-        else:
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_bias, is_causal=use_causal, dropout_p=self.attn_dropout.p if self.training else 0.0
-            )
 
         # Re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -216,8 +439,13 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         dropout_rate: float,
         use_flash_attention: bool = True,
+        attention_norm: str = "softmax",
         attn_lora_rank: int = 0,
         attn_lora_alpha: float = 1.0,
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
+        enable_relative_attention_bias: bool = False,
+        max_length: Optional[int] = None,
     ):
         super().__init__()
         self.ln_1 = nn.LayerNorm(hidden_units, eps=1e-8)
@@ -226,8 +454,13 @@ class TransformerBlock(nn.Module):
             num_heads,
             dropout_rate,
             use_flash_attention=use_flash_attention,
+            attention_norm=attention_norm,
             lora_rank=attn_lora_rank,
             lora_alpha=attn_lora_alpha,
+            use_rope=use_rope,
+            rope_base=rope_base,
+            enable_relative_attention_bias=enable_relative_attention_bias,
+            max_length=max_length,
         )
         self.ln_2 = nn.LayerNorm(hidden_units, eps=1e-8)
         self.ffn = MLP(hidden_units, dropout_rate)
@@ -250,10 +483,16 @@ class SASRec(nn.Module):
         self.max_seq_length = config.max_seq_length
         self.hidden_units = config.hidden_units
         self.patch_len = config.patch_len
+        self.attention_norm = _normalize_attention_norm(getattr(config, "sasrec_attention_norm", "softmax"))
+        self.use_rope = bool(getattr(config, "sasrec_use_rope", False))
+        self.rope_base = float(getattr(config, "sasrec_rope_base", 10000.0))
+        self.enable_relative_attention_bias = bool(getattr(config, "sasrec_enable_relative_attention_bias", False))
         self.persrec_enable = bool(getattr(config, "persrec_enable", False))
         self.persrec_num_tokens = int(getattr(config, "persrec_num_tokens", 0) or 0)
         self.persrec_pretrain_len = int(getattr(config, "persrec_pretrain_len", 0) or 0)
         self.persrec_recent_len = int(getattr(config, "persrec_recent_len", 0) or 0)
+        self.shared_prefix_len = shared_token_len_from_config(config)
+        self.shared_prefix_init_std = shared_token_init_std_from_config(config)
 
         # Embedding layers
         # +2 to reserve PAD=0 and UNK=1
@@ -265,7 +504,15 @@ class SASRec(nn.Module):
             if input_emb_lora_rank > 0
             else None
         )
+        if self.shared_prefix_len > 0:
+            self.shared_prefix_tokens = nn.Parameter(
+                torch.randn(1, self.shared_prefix_len, self.hidden_units) * self.shared_prefix_init_std
+            )
+        else:
+            self.register_parameter("shared_prefix_tokens", None)
         if self.persrec_enable:
+            if self.shared_prefix_len > 0:
+                raise ValueError("shared_prefix_len is not supported together with persrec_enable.")
             if self.persrec_num_tokens <= 0:
                 raise ValueError("persrec_num_tokens must be > 0 when persrec_enable=True.")
             if self.persrec_pretrain_len <= 0 or self.persrec_recent_len <= 0:
@@ -278,13 +525,32 @@ class SASRec(nn.Module):
                     self.max_seq_length,
                 )
             self.pos_emb = nn.Embedding(
-                config.max_seq_length + self.persrec_num_tokens + 1, config.hidden_units, padding_idx=0
+                config.max_seq_length + self.shared_prefix_len + self.persrec_num_tokens + 1,
+                config.hidden_units,
+                padding_idx=0,
             )
             self.persrec_tokens = nn.Parameter(
                 torch.randn(1, self.persrec_num_tokens, self.hidden_units)
             )
         else:
-            self.pos_emb = nn.Embedding(config.max_seq_length + 1, config.hidden_units, padding_idx=0)
+            self.pos_emb = nn.Embedding(
+                config.max_seq_length + self.shared_prefix_len + 1,
+                config.hidden_units,
+                padding_idx=0,
+            )
+        self.score_calibration = ScoreCalibrationHead(
+            item_num + 2,
+            max_seq_length=self.max_seq_length,
+            enable_item_bias=bool(getattr(config, "enable_score_item_bias", False)),
+            enable_length_bias=bool(getattr(config, "enable_score_length_bias", False)),
+            enable_length_scale=bool(getattr(config, "enable_score_length_scale", False)),
+            bucket_size=int(getattr(config, "score_length_bucket_size", 20) or 20),
+        )
+        attn_max_length = (
+            self.max_seq_length
+            + self.shared_prefix_len
+            + (self.persrec_num_tokens if self.persrec_enable else self.patch_len)
+        )
         self.emb_dropout = nn.Dropout(config.dropout_rate)
 
         # Transformer blocks
@@ -301,8 +567,13 @@ class SASRec(nn.Module):
                     config.num_heads,
                     config.dropout_rate,
                     use_flash_attention=config.use_flash_attention,
+                    attention_norm=self.attention_norm,
                     attn_lora_rank=attn_lora_rank if i in attn_lora_blocks else 0,
                     attn_lora_alpha=attn_lora_alpha,
+                    use_rope=self.use_rope,
+                    rope_base=self.rope_base,
+                    enable_relative_attention_bias=self.enable_relative_attention_bias,
+                    max_length=attn_max_length,
                 )
                 for i in range(config.num_blocks)
             ]
@@ -320,6 +591,7 @@ class SASRec(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
+        self.score_calibration.reset_parameters()
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -337,9 +609,13 @@ class SASRec(nn.Module):
         """Freeze the transformer body (backbone)."""
         for p in self.item_emb.parameters():
             p.requires_grad = False
+        for p in self.score_calibration.parameters():
+            p.requires_grad = False
         if self.input_emb_lora is not None:
             for p in self.input_emb_lora.parameters():
                 p.requires_grad = False
+        if self.shared_prefix_tokens is not None:
+            self.shared_prefix_tokens.requires_grad_(False)
         for p in self.pos_emb.parameters():
             p.requires_grad = False
         for block in self.blocks:
@@ -353,6 +629,110 @@ class SASRec(nn.Module):
         if self.input_emb_lora is not None:
             item_embs = item_embs + self.input_emb_lora(input_ids)
         return item_embs
+
+    def _shared_token_count(self) -> int:
+        if self.shared_prefix_tokens is None:
+            return 0
+        return int(self.shared_prefix_tokens.size(1))
+
+    def _shared_token_states(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        shared_len = self._shared_token_count()
+        if shared_len <= 0:
+            return None
+        shared_states = expand_shared_token_bank(
+            self.shared_prefix_tokens,
+            batch_size,
+            device=device,
+            dtype=dtype,
+        )
+        positions = torch.arange(1, shared_len + 1, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
+        return shared_states + self.pos_emb(positions).to(dtype)
+
+    def _build_item_positions(self, input_ids: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_length = input_ids.size()
+        positions = torch.arange(1, seq_length + 1, dtype=torch.long, device=input_ids.device)
+        positions = positions.unsqueeze(0).expand(batch_size, -1)
+        prefix_len = int(getattr(self.config, "prefix_len", 0) or 0)
+        use_prefix_tail_pos = bool(getattr(self.config, "prefix_tail_positions", False))
+        if use_prefix_tail_pos and prefix_len > 0 and seq_length <= self.max_seq_length:
+            prefix_len = min(prefix_len, seq_length)
+            tail_len = max(seq_length - prefix_len, 0)
+            pos_custom = torch.zeros_like(positions)
+            if prefix_len > 0:
+                prefix_pos = torch.arange(1, prefix_len + 1, dtype=torch.long, device=input_ids.device)
+                pos_custom[:, :prefix_len] = prefix_pos
+            if tail_len > 0:
+                tail_start = max(self.max_seq_length - tail_len + 1, 1)
+                tail_pos = torch.arange(tail_start, tail_start + tail_len, dtype=torch.long, device=input_ids.device)
+                pos_custom[:, prefix_len:] = tail_pos
+            positions = pos_custom
+        elif getattr(self.config, "right_align_positions", True):
+            offset = max(self.max_seq_length - seq_length, 0)
+            if offset > 0:
+                positions = positions + offset
+        positions = positions * (input_ids != 0).long()
+        shared_len = self._shared_token_count()
+        if shared_len > 0:
+            positions = torch.where(positions > 0, positions + shared_len, positions)
+        return positions
+
+    def _build_patch_positions(self, input_ids: torch.Tensor, item_positions: torch.Tensor) -> torch.Tensor:
+        batch_size = input_ids.size(0)
+        if self.patch_len <= 0:
+            return item_positions.new_zeros((batch_size, 0))
+        shared_len = self._shared_token_count()
+        max_pos = self.max_seq_length + shared_len
+        min_start = shared_len + 1
+        max_start = max(min_start, max_pos - self.patch_len + 1)
+        large = max_pos + self.patch_len + 1
+
+        prefix_len = int(getattr(self.config, "prefix_len", 0) or 0)
+        patch_after_prefix = bool(getattr(self.config, "patch_after_prefix", False))
+        if patch_after_prefix and prefix_len > 0:
+            prefix_eff = min(prefix_len, item_positions.size(1))
+            prefix_part = item_positions[:, :prefix_eff]
+            tail_part = item_positions[:, prefix_eff:]
+            prefix_last = (
+                prefix_part.max(dim=1).values
+                if prefix_part.numel() > 0
+                else item_positions.new_full((batch_size,), shared_len)
+            )
+            if tail_part.numel() > 0:
+                tail_min = torch.where(tail_part > 0, tail_part, torch.full_like(tail_part, large)).min(dim=1).values
+                start = torch.minimum(prefix_last + 1, tail_min - self.patch_len)
+            else:
+                start = prefix_last + 1
+        else:
+            first_item = torch.where(item_positions > 0, item_positions, torch.full_like(item_positions, large)).min(dim=1).values
+            fallback = item_positions.new_full((batch_size,), max_start)
+            start = torch.where(first_item < large, first_item - self.patch_len, fallback)
+
+        start = torch.clamp(start, min=min_start, max=max_start)
+        offsets = torch.arange(self.patch_len, dtype=item_positions.dtype, device=item_positions.device)
+        return start.unsqueeze(1) + offsets.unsqueeze(0)
+
+    def _patch_token_start(self, seq_length: int) -> int:
+        start = self._shared_token_count()
+        prefix_len = int(getattr(self.config, "prefix_len", 0) or 0)
+        if bool(getattr(self.config, "patch_after_prefix", False)) and prefix_len > 0:
+            start += min(prefix_len, seq_length)
+        return start
+
+    def _strip_patch_tokens(self, hidden_states: torch.Tensor, seq_length: int) -> torch.Tensor:
+        if self.patch_len <= 0:
+            return hidden_states
+        patch_start = self._patch_token_start(seq_length)
+        patch_end = min(hidden_states.size(1), patch_start + self.patch_len)
+        return torch.cat([hidden_states[:, :patch_start, :], hidden_states[:, patch_end:, :]], dim=1)
+
+    def _strip_shared_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return strip_leading_tokens(hidden_states, self._shared_token_count())
 
     def _sequence_summary(self, item_embs: torch.Tensor, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return last-item embedding and sequence lengths."""
@@ -549,45 +929,37 @@ class SASRec(nn.Module):
             hidden_states, attn_mask = self._build_persrec_embeddings(item_embs, input_ids)
         else:
             # Positional embeddings
-            positions = torch.arange(1, seq_length + 1, dtype=torch.long, device=input_ids.device)
-            positions = positions.unsqueeze(0).expand(batch_size, -1)
-            prefix_len = int(getattr(self.config, "prefix_len", 0) or 0)
-            use_prefix_tail_pos = bool(getattr(self.config, "prefix_tail_positions", False))
-            if use_prefix_tail_pos and prefix_len > 0 and seq_length <= self.max_seq_length:
-                prefix_len = min(prefix_len, seq_length)
-                tail_len = max(seq_length - prefix_len, 0)
-                pos_custom = torch.zeros_like(positions)
-                if prefix_len > 0:
-                    prefix_pos = torch.arange(1, prefix_len + 1, dtype=torch.long, device=input_ids.device)
-                    pos_custom[:, :prefix_len] = prefix_pos
-                if tail_len > 0:
-                    tail_start = max(self.max_seq_length - tail_len + 1, 1)
-                    tail_pos = torch.arange(
-                        tail_start, tail_start + tail_len, dtype=torch.long, device=input_ids.device
-                    )
-                    pos_custom[:, prefix_len:] = tail_pos
-                positions = pos_custom
-            elif getattr(self.config, "right_align_positions", True):
-                offset = max(self.max_seq_length - seq_length, 0)
-                if offset > 0:
-                    positions = positions + offset
-            positions = positions * (input_ids != 0).long()
+            positions = self._build_item_positions(input_ids)
+            shared_states = self._shared_token_states(batch_size, device=input_ids.device, dtype=item_embs.dtype)
 
             if use_patch and self.patch_len > 0:
                 pos_embs_item = self.pos_emb(positions)
                 item_with_pos = item_embs + pos_embs_item
+                if bool(getattr(self.config, "patch_use_position_embeddings", False)):
+                    patch_positions = self._build_patch_positions(input_ids, positions)
+                    patch_emb = patch_emb + self.pos_emb(patch_positions).to(patch_emb.dtype)
                 prefix_len = int(getattr(self.config, "prefix_len", 0) or 0)
                 patch_after_prefix = bool(getattr(self.config, "patch_after_prefix", False))
                 if patch_after_prefix and prefix_len > 0:
                     prefix_len = min(prefix_len, seq_length)
                     prefix_part = item_with_pos[:, :prefix_len, :]
                     tail_part = item_with_pos[:, prefix_len:, :]
-                    hidden_states = torch.cat([prefix_part, patch_emb, tail_part], dim=1)
+                    pieces = []
+                    if shared_states is not None:
+                        pieces.append(shared_states)
+                    pieces.extend([prefix_part, patch_emb, tail_part])
+                    hidden_states = torch.cat(pieces, dim=1)
                 else:
-                    hidden_states = torch.cat([patch_emb, item_with_pos], dim=1)
+                    pieces = []
+                    if shared_states is not None:
+                        pieces.append(shared_states)
+                    pieces.extend([patch_emb, item_with_pos])
+                    hidden_states = torch.cat(pieces, dim=1)
             else:
                 pos_embs = self.pos_emb(positions)
                 hidden_states = item_embs + pos_embs
+                if shared_states is not None:
+                    hidden_states = torch.cat([shared_states, hidden_states], dim=1)
 
         hidden_states = self.emb_dropout(hidden_states)
 
@@ -671,7 +1043,8 @@ class SASRec(nn.Module):
             input_ids, user_ids=user_ids, patch_params=patch_params, use_patch=use_patch
         )
         if use_patch and self.patch_len > 0:
-            hidden_states = hidden_states[:, self.patch_len :, :]
+            hidden_states = self._strip_patch_tokens(hidden_states, input_ids.size(1))
+        hidden_states = self._strip_shared_tokens(hidden_states)
         if self.persrec_enable and self.persrec_num_tokens > 0:
             pre, _ = self._resolve_persrec_lengths(input_ids.size(1))
             k = self.persrec_num_tokens
@@ -681,6 +1054,8 @@ class SASRec(nn.Module):
             final_hidden = self.apply_head(final_hidden, head_params=head_params)
         candidate_embs = self.item_emb(candidate_ids)  # [B, C, H]
         scores = torch.bmm(candidate_embs, final_hidden.unsqueeze(-1)).squeeze(-1)  # [B, C]
+        seq_lengths = (input_ids != 0).sum(dim=1)
+        scores = self.score_calibration(scores, candidate_ids, seq_lengths)
         return scores
 
     def training_step(
@@ -715,7 +1090,8 @@ class SASRec(nn.Module):
             use_patch=use_patch,
         )
         if use_patch and self.patch_len > 0:
-            hidden_states = hidden_states[:, self.patch_len :, :]
+            hidden_states = self._strip_patch_tokens(hidden_states, input_ids.size(1))
+        hidden_states = self._strip_shared_tokens(hidden_states)
         projected = self.apply_head(hidden_states, head_params=head_params)
         if self.persrec_enable and self.persrec_num_tokens > 0:
             target_seq, loss_mask, pretrain_len = self._build_persrec_target_sequence(input_ids)
@@ -732,6 +1108,9 @@ class SASRec(nn.Module):
             neg_logits = (projected.unsqueeze(2) * neg_embs).sum(dim=-1)  # [B, T, K]
         else:
             neg_logits = (projected * neg_embs).sum(dim=-1)  # [B, T]
+        seq_lengths = (input_ids != 0).sum(dim=1)
+        pos_logits = self.score_calibration(pos_logits, pos_ids, seq_lengths)
+        neg_logits = self.score_calibration(neg_logits, neg_ids, seq_lengths)
 
         if return_gating and return_loss_mask:
             return pos_logits, neg_logits, gating_weights, loss_mask

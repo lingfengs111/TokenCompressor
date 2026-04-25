@@ -58,6 +58,14 @@ class MetaPatch(nn.Module):
         gate_flat = eta[self.patch_param_size :]
         return patch_flat, gate_flat
 
+    def get_patch_bank(self, eta: torch.Tensor | None = None) -> torch.Tensor:
+        if eta is None:
+            eta = self.eta
+        if self.patch_len == 0:
+            return eta.new_zeros((self.num_patches, 0, self.hidden_units))
+        patch_flat, _ = self._split_eta(eta)
+        return patch_flat.view(self.num_patches, self.patch_len, self.hidden_units)
+
     def forward(self, seq_emb: torch.Tensor, user_ids: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.forward_with_eta(seq_emb, self.eta, user_ids=user_ids)
 

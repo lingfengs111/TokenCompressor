@@ -1,4 +1,4 @@
-"""Leave-two-out dataset utilities for ID-only training."""
+"""Protocol-aware sequential dataset utilities for ID-only training."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from typing import Optional
 
 import numpy as np
 from torch.utils.data import Dataset
+
+from core.streaming_eval import resolve_train_cutoff
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,10 @@ LOO_DATASETS = {
         name="ml10m_loo202",
         root=Path("/home/lingfengs111/codes/soft_patch_training/data/movielens/ml-10m/loo_202"),
     ),
+    "xlong_loo402": LooDatasetSpec(
+        name="xlong_loo402",
+        root=Path("/home/lingfengs111/codes/soft_patch_training/data/xlong2018/loo_402"),
+    ),
 }
 
 LOO_DATASET_ALIASES = {
@@ -50,6 +56,9 @@ LOO_DATASET_ALIASES = {
     "ml-10m": "ml10m_loo202",
     "ml10m": "ml10m_loo202",
     "movielens-10m": "ml10m_loo202",
+    "xlong": "xlong_loo402",
+    "xlong2018": "xlong_loo402",
+    "xlong-2018": "xlong_loo402",
 }
 
 
@@ -88,7 +97,7 @@ def resolve_loo_dataset(dataset: str, data_dir: Optional[str] = None) -> LooData
 def infer_loo_min_len(spec: LooDatasetSpec) -> Optional[int]:
     candidates = [spec.name, spec.root.name]
     for text in candidates:
-        match = re.search(r"loo[_-]?(\\d+)", text, re.IGNORECASE)
+        match = re.search(r"loo[_-]?(\d+)", text, re.IGNORECASE)
         if match:
             return int(match.group(1))
     if spec.stats_json.exists():
@@ -104,7 +113,7 @@ def infer_loo_min_len(spec: LooDatasetSpec) -> Optional[int]:
 
 
 class LooSequenceDataset(Dataset):
-    """Sequence dataset from data.txt (user item1 item2 ... itemN) with leave-two-out."""
+    """Sequence dataset from data.txt with protocol-aware train/test holdout."""
 
     def __init__(
         self,
@@ -159,7 +168,11 @@ class LooSequenceDataset(Dataset):
                 self.user_seq[internal_id] = items
                 self.users.append(internal_id)
                 self.internal_to_user_id[internal_id] = user_id
-                train_len = max(len(items) - 2, 0)
+                train_len = resolve_train_cutoff(
+                    len(items),
+                    eval_protocol=getattr(config, "eval_protocol", "legacy_loo"),
+                    last_k_eval_test=int(getattr(config, "last_k_eval_test", 0) or 0),
+                )
                 if train_len > max_train_len:
                     max_train_len = train_len
                 internal_id += 1
