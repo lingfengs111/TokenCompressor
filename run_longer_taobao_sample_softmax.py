@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from pathlib import Path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -67,10 +68,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_arg_parser().parse_args()
 
+    repo_root = Path(__file__).resolve().parent
+
     config = tbs.SASRecConfig()
     config.backbone = "longer"
     config.dataset = args.dataset
     config.device = args.device
+    config.checkpoint_dir = repo_root / "checkpoints"
     config.max_seq_length = int(args.max_seq_length)
     config.batch_size = args.batch_size
     config.num_epochs = args.num_epochs
