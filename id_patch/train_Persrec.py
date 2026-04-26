@@ -155,11 +155,18 @@ class BaselineConfig:
 
     # Evaluation
     eval_seq_length: int = 20  # Short-view length for eval truncation
-    persrec_eval_use_full_seq: bool = True  # If True, eval uses full long sequence
+    # If True, evaluation feeds the full long sequence into the backbone instead of truncating to eval_seq_length.
+    # This does NOT by itself let recent positions directly see pretrain raw items: PersRec backbones still apply
+    # a segment mask that cuts recent -> pretrain raw-item attention and forces communication through PersRec tokens.
+    persrec_eval_use_full_seq: bool = True
     persrec_train_mode: str = "full"  # full | tokens | tokens_bias_ln | tokens_bias_ln_head
-    eval_protocol: str = "legacy_loo"  # legacy_loo | holdout_anchor
-    last_k_eval_test: int = 10  # Used when eval_protocol=holdout_anchor
-    streaming_eval_last_k: int = 0  # If >1, run extra rolling final-test eval on the last K targets
+    # legacy_loo: test on the final item. holdout_anchor: evaluate inside a held-out tail block instead.
+    eval_protocol: str = "legacy_loo"
+    # Used when eval_protocol=holdout_anchor. With streaming_eval_last_k <= 1, validation uses seq[-k] and
+    # test uses the midpoint anchor seq[-k//2], not the final item.
+    last_k_eval_test: int = 10
+    # If >1, run an extra rolling final-test eval on the last K targets; this overrides the single holdout anchor.
+    streaming_eval_last_k: int = 0
 
     # Device
     device: str = "cuda:2"
@@ -620,6 +627,9 @@ def resolve_eval_protocol_config(config: BaselineConfig) -> None:
 
 def resolve_eval_truncate_len(config: BaselineConfig) -> Optional[int]:
     if config.persrec_enable and config.persrec_eval_use_full_seq:
+        # Returning None here only disables external truncation before the model call.
+        # It should not be read as "recent can directly attend to the whole prefix": PersRec masking in the
+        # backbone still blocks recent -> pretrain raw-item edges when persrec_enable=True.
         return None
     return config.eval_seq_length
 

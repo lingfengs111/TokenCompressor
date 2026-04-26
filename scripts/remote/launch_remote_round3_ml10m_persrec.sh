@@ -17,8 +17,8 @@ require_file "$HSTU_WARMSTART_CKPT"
 cd "$ROOT"
 
 launch_job \
-  "persrec_sasrec_ml10m_warmstart_remote" \
-  "$LOG_DIR/persrec_sasrec_ml10m_warmstart_remote.log" \
+  "persrec_sasrec_ml10m_warmstart_legacyloo_remote" \
+  "$LOG_DIR/persrec_sasrec_ml10m_warmstart_legacyloo_remote.log" \
   env WANDB_MODE="$WANDB_MODE" "$PYTHON_BIN" "$ROOT/id_patch/train_Persrec.py" \
     --dataset ml10m_loo202 \
     --device "cuda:${SASREC_PERSREC_GPU}" \
@@ -38,20 +38,20 @@ launch_job \
     --persrec_eval_use_full_seq true \
     --persrec_train_mode full \
     --eval_seq_length 20 \
-    --eval_protocol holdout_anchor \
-    --last_k_eval_test 10 \
-    --streaming_eval_last_k 9 \
+    --eval_protocol legacy_loo \
+    --last_k_eval_test 0 \
+    --streaming_eval_last_k 0 \
     --batch_size 128 \
     --num_epochs 50 \
     --max_learning_rate 2.0360441936032465e-05 \
     --min_learning_rate 1e-06 \
     --scheduler_type cosine \
-    --checkpoint_dir "$ROOT/checkpoints/persrec_sasrec_ml10m_warmstart_remote" \
+    --checkpoint_dir "$ROOT/checkpoints/persrec_sasrec_ml10m_warmstart_legacyloo_remote" \
     --pretrained_ckpt_path "$SASREC_WARMSTART_CKPT"
 
 launch_job \
-  "persrec_hstu_ml10m_warmstart_remote" \
-  "$LOG_DIR/persrec_hstu_ml10m_warmstart_remote.log" \
+  "persrec_hstu_ml10m_warmstart_legacyloo_remote" \
+  "$LOG_DIR/persrec_hstu_ml10m_warmstart_legacyloo_remote.log" \
   env WANDB_MODE="$WANDB_MODE" "$PYTHON_BIN" "$ROOT/id_patch/train_Persrec.py" \
     --dataset ml10m_loo202 \
     --device "cuda:${HSTU_PERSREC_GPU}" \
@@ -72,15 +72,15 @@ launch_job \
     --persrec_eval_use_full_seq true \
     --persrec_train_mode full \
     --eval_seq_length 20 \
-    --eval_protocol holdout_anchor \
-    --last_k_eval_test 10 \
-    --streaming_eval_last_k 9 \
+    --eval_protocol legacy_loo \
+    --last_k_eval_test 0 \
+    --streaming_eval_last_k 0 \
     --batch_size 64 \
     --num_epochs 50 \
     --max_learning_rate 2.0360441936032465e-05 \
     --min_learning_rate 1e-06 \
     --scheduler_type cosine \
-    --checkpoint_dir "$ROOT/checkpoints/persrec_hstu_ml10m_warmstart_remote" \
+    --checkpoint_dir "$ROOT/checkpoints/persrec_hstu_ml10m_warmstart_legacyloo_remote" \
     --pretrained_ckpt_path "$HSTU_WARMSTART_CKPT"
 
 echo

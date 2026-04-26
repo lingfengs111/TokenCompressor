@@ -40,7 +40,7 @@ launch_job \
     --prefetch-factor 2 \
     --eval-sample-size 1000 \
     --eval-protocol legacy_loo \
-    --last-k-eval-test 10 \
+    --last-k-eval-test 0 \
     --streaming-eval-last-k 0 \
     --selection-metric ndcg@10 \
     --temperature 0.07 \

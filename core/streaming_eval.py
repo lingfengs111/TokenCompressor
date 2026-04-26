@@ -91,6 +91,9 @@ def resolve_eval_target_positions(
     if protocol == LEGACY_LOO_PROTOCOL:
         target_idx = seq_len - 1
     else:
+        # holdout_anchor keeps the last_k_eval_test items fully hidden from training, then evaluates at the
+        # midpoint anchor inside that hidden block. Example: last_k_eval_test=10 -> test target is seq[-5].
+        # This is intentionally different from legacy_loo's final-item target.
         target_idx = seq_len - (holdout_k // 2)
     if target_idx < min_context_len:
         return []
