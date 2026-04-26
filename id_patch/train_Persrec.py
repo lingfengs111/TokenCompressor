@@ -619,6 +619,12 @@ def resolve_persrec_config(config: BaselineConfig) -> None:
 def resolve_eval_protocol_config(config: BaselineConfig) -> None:
     config.eval_protocol = normalize_eval_protocol(getattr(config, "eval_protocol", "legacy_loo"))
     config.last_k_eval_test = int(getattr(config, "last_k_eval_test", 0) or 0)
+    if config.eval_protocol == "legacy_loo" and config.last_k_eval_test != 0:
+        logger.warning(
+            "Ignoring last_k_eval_test=%s because eval_protocol=legacy_loo uses the final item target.",
+            config.last_k_eval_test,
+        )
+        config.last_k_eval_test = 0
     if config.eval_protocol != "legacy_loo" and config.last_k_eval_test < 2:
         raise ValueError(
             f"holdout_anchor protocol requires last_k_eval_test >= 2, got {config.last_k_eval_test}."

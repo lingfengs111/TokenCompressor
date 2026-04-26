@@ -238,6 +238,8 @@ class SASRecConfig:
         self.selection_metric = str(self.selection_metric).lower()
         self.eval_protocol = normalize_eval_protocol(getattr(self, "eval_protocol", LEGACY_LOO_PROTOCOL))
         self.last_k_eval_test = int(getattr(self, "last_k_eval_test", 0) or 0)
+        if self.eval_protocol == LEGACY_LOO_PROTOCOL:
+            self.last_k_eval_test = 0
         self.streaming_eval_last_k = int(getattr(self, "streaming_eval_last_k", 0) or 0)
         if self.hstu_normalization not in {"rel_bias", "hstu_rel_bias", "softmax_rel_bias", "softmax1_rel_bias"}:
             raise ValueError(f"Unsupported hstu_normalization: {self.hstu_normalization}")
@@ -511,6 +513,12 @@ def resolve_dataset_config(config: SASRecConfig) -> None:
 def resolve_eval_protocol_config(config: SASRecConfig) -> None:
     config.eval_protocol = normalize_eval_protocol(getattr(config, "eval_protocol", LEGACY_LOO_PROTOCOL))
     config.last_k_eval_test = int(getattr(config, "last_k_eval_test", 0) or 0)
+    if config.eval_protocol == LEGACY_LOO_PROTOCOL and config.last_k_eval_test != 0:
+        logger.warning(
+            "Ignoring last_k_eval_test=%s because eval_protocol=legacy_loo uses the final item target.",
+            config.last_k_eval_test,
+        )
+        config.last_k_eval_test = 0
     config.streaming_eval_last_k = int(getattr(config, "streaming_eval_last_k", 0) or 0)
     if config.eval_protocol != LEGACY_LOO_PROTOCOL and config.last_k_eval_test < 2:
         raise ValueError(
